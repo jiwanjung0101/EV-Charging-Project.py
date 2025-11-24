@@ -1,110 +1,97 @@
-from datetime import datetime, timedelta
+import pandas as pd
 import pulp as lp
 
-# EV class definition
-class EV:
-    def __init__(self, arrival_soc, target_soc, battery_capacity, charging_efficiency):
-        #EV attributes
-        self.arrival_soc = arrival_soc
-        self.target_soc = target_soc
-        self.battery_capacity = battery_capacity
-        self.charging_efficiency = charging_efficiency
+def load_prices(path="eprice.csv"):
+    df = pd.read_csv(path).head(48)
+    df["Time"] = range(1, 49)
+    prices = dict(zip(df["Time"], df["Price"]))
+    return prices, list(prices.keys())
 
-    # Calculate energy needed considering efficiency
-    def energy_needed(self):
-        raw_energy = max(0, (self.target_soc - self.arrival_soc) * self.battery_capacity)
-        adjusted_energy = raw_energy / self.charging_efficiency  # adjust for efficiency losses
-        return min(adjusted_energy, self.battery_capacity)
+def load_evs(path="ev_info.csv"):
+    df = pd.read_csv(path)
+    evs = []
 
-def power(price_now, base_price, Erem, Tleft, max_power):
-    # minimum power required to finish on time
-    Pmin_needed = Erem / Tleft
+    for _, row in df.iterrows():
+        evs.append({
+            "name": str(row["EV"]),
+            "arrival": int(row["Arrival Time"]),
+            "departure": int(row["Departure Time"]),
+            "arrival_energy": float(row["Arrival Energy"]),
+            "desired_energy": float(row["Desired Energy"]),
+            "max_power": 7.0   # kW power limit
+        })
 
-    # sensitivity coeffecient
-    k = 20.0
+    return evs
 
-    # power calculation
-    P = Pmin_needed + k * (base_price - price_now)
+def ev_scheduler():
+    prices, time_slots = load_prices()
+    evs = load_evs()
+    discharging_price = 0.05  # $0.05 per kWh for discharging
 
-    # physical constraints
-    if P < Pmin_needed:
-        P = Pmin_needed
-    if P > max_power:
-        P = max_power
+    interval_hours = 0.5  # 30-minute interval
+    model = lp.LpProblem("SimpleChargingOnly", lp.LpMinimize)
 
-    return P
+    # Decision variables: c[ev, t]
+    c = lp.LpVariable.dicts(
+        "c",
+        ((ev["name"], t) for ev in evs for t in time_slots),
+        lowBound=0,
+        cat="Continuous"
+    )
+    d = lp.LpVariable.dicts(
+        "d",
+        ((ev["name"], t) for ev in evs for t in time_slots),
+        lowBound=0,
+        cat="Continuous"
+    )
 
-# EV charging scheduler function
-def ev_scheduler(ev, arrival_time, departure_time, price):
-    #charging station contraints
-    max_power = 50 # kW
-    dt = 0.25 # hours
-    time_duration = (departure_time - arrival_time).total_seconds()/3600 # in hours
-    Erem = ev.energy_needed()
-    intervals = int(time_duration / dt)
-    base_price = 0.30  # base price in $/kWh
-    
-    # Initialize variables
-    total_cost = 0.0
-    power_values = []
-    cumulative_energy = 0.0
+    # Objective: minimize cost over all EVs and times
+    model += lp.lpSum(
+        prices[t] * (c[(ev["name"], t)] * interval_hours) -  
+        discharging_price*(d[(ev["name"],t)] * interval_hours)  # cost = price * energy
+        for ev in evs for t in time_slots
+    )
 
-    # Iterate over each time interval
-    for i in range(intervals):
-        power_kw = power(price[i], base_price, Erem, time_duration - i * dt, max_power)
-        
-        #
-        energy_this_interval = power_kw * dt
-        if cumulative_energy + energy_this_interval > Erem:
-            energy_this_interval = Erem - cumulative_energy
-            power_kw = energy_this_interval / dt
+    # Constraints
+    for ev in evs:
+        # Required energy
+        required_energy = ev["desired_energy"] - ev["arrival_energy"]
+        model += lp.lpSum(
+            c[(ev["name"], t)] * interval_hours
+            for t in time_slots
+            if ev["arrival"] <= t <= ev["departure"]
+        ) - lp.lpSum(
+            d[(ev["name"], t)] * interval_hours
+            for t in time_slots
+            if ev["arrival"] <= t <= ev["departure"]
+        ) >= required_energy
 
-        total_cost += power_kw * price[i] * dt
-        power_values.append(power_kw)
-        cumulative_energy += energy_this_interval 
+        # Only charge inside availability window
+        for t in time_slots:
+            if not (ev["arrival"] <= t <= ev["departure"]):
+                model += c[(ev["name"], t)] == 0
+                model += d[(ev["name"], t)] == 0
 
-        print(f"Interval {i + 1}: Power = {power_kw:.2f} kW, Cumulative Energy = {cumulative_energy:.2f} kWh")
+                
+        # Power limit
+        for t in time_slots:
+            model += c[(ev["name"], t)] <= ev["max_power"]
+            model += d[(ev["name"], t)] <= ev["max_power"]
 
-        if cumulative_energy >= Erem:
-            finish_time = arrival_time + timedelta(hours=i * dt)
-            break
+    # Solve
+    model.solve(lp.PULP_CBC_CMD(msg=0))
 
-    return {
-        "status": True,
-        "total_cost": total_cost,
-        "finish_time": finish_time,
-        "duration_hr": time_duration,
-        "intervals": intervals,
-        "power_values": power_values
-    }
+    print("Status:", lp.LpStatus[model.status])
+    print("Total Cost:", lp.value(model.objective))
 
-# Test the EV charging scheduler
-def main():
-    ev = EV(0.2, 0.8, 50, 0.9)
-    arrival = datetime(2025, 11, 13, 8, 0)
-    departure = datetime(2025, 11, 13, 12, 0)
-    price = [0.25, 0.20, 0.15, 0.10, 0.12, 0.18, 0.22, 0.30, 0.28, 0.26, 0.24, 0.22, 0.20, 0.18, 0.16, 0.14]  # $/kWh for each 15-min interval
+    # Print schedule
+    for ev in evs:
+        print(f"\nEV {ev['name']} schedule:")
+        for t in time_slots:
+            val = c[(ev["name"], t)].value()
+            if val > 1e-4:
+                print(f"  Time {t}: charge {val:.2f} kW")
 
-    result = ev_scheduler(ev, arrival, departure, price)
-
-    print("=== EV Charging Summary ===")
-    print(f"Arrival:  {arrival.strftime('%H:%M')} | Departure: {departure.strftime('%H:%M')}")
-    if result["status"]:
-        print(f"Total Cost: ${result['total_cost']:.2f}")
-        total_energy_charged = sum(result['power_values']) * 0.25  # Multiply by interval duration (0.25 hours)
-        desired_energy = ev.energy_needed()
-        print(f"Total Energy Charged: {total_energy_charged:.2f} kWh")
-        print(f"Desired Energy: {desired_energy:.2f} kWh")
-        if abs(total_energy_charged - desired_energy) < 0.01:  # Allow a small margin of error
-            print("✅ Charging met the desired energy.")
-        else:
-            print("⚠️ Charging did not meet the desired energy.")
-        print(f"Finish Time: {result['finish_time'].strftime('%H:%M')}")
-    else:
-        print("⚠️ Charging not possible (power constraint).")
-
-    for i, power_kw in enumerate(result['power_values']):
-        print(f"Interval {i + 1}: Power = {power_kw:.2f} kW, Price = ${price[i]:.2f}")
 
 if __name__ == "__main__":
-    main()
+    ev_scheduler()

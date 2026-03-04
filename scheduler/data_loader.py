@@ -34,3 +34,16 @@ def load_evs(filename="ev_info.csv"):
             desired_energy=float(row["Desired Energy"])
         ))
     return evs
+
+def load_carbon_intensity(filename = "df_fuel_ckan.csv"):
+    path = os.path.join(DATA_DIR, filename)
+    df = pd.read_csv(path)
+    df = df.iloc[300338:300386].reset_index(drop=True)
+    df = df.head(48)
+
+    df["Period"] = range(1, 49)
+    df["CARBON_INTENSITY"] = df["CARBON_INTENSITY"] / 1000
+
+    carbon = dict(zip(df["Period"], df["CARBON_INTENSITY"]))
+
+    return carbon, list(carbon.keys())

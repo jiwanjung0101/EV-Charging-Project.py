@@ -1,11 +1,11 @@
 # Save EV schedule data
 import os
 import pandas as pd
-from scheduler.data_loader import load_prices, load_evs
+from scheduler.data_loader import load_prices, load_evs, load_carbon_intensity
 from scheduler.model import run_scheduler
 from scheduler.plot import plot_prices, plot_power, plot_energy
 
-def ev_schedule(prices, time_slots, c, d, evs, interval_hours=0.5, save_path="data/ev_schedule.csv"):
+def ev_schedule(prices, carbon, time_slots, c, d, evs, interval_hours=0.5, save_path="data/ev_schedule.csv"):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     data_rows = []
 
@@ -18,6 +18,7 @@ def ev_schedule(prices, time_slots, c, d, evs, interval_hours=0.5, save_path="da
                 continue
             net_energy = (charge - discharge) * interval_hours
             cost = net_energy * prices[t]
+            emission = charge * interval_hours * carbon[t]
             data_rows.append({
                 "EV": name,
                 "Time": t,
@@ -26,6 +27,7 @@ def ev_schedule(prices, time_slots, c, d, evs, interval_hours=0.5, save_path="da
                 "Net Energy (kWh)": net_energy,
                 "Price ($/kWh)": prices[t],
                 "Cost ($)": cost,
+                "Emissions (kgCO2)": emission,
             })
     df = pd.DataFrame(data_rows)
     df.to_csv(save_path, index=False)

@@ -99,3 +99,18 @@ def plot_power_price(time_list, total_charge, total_discharge, price_list,
         plt.savefig(save_path)
 
     plt.show()
+
+
+def plot_carbon_intensity(time_list, carbon_list, save_path="plots/carbon_intensity.png"):
+    plt.figure(figsize=(10, 4))
+    plt.plot(time_list, carbon_list, color='green', linewidth=2)
+    plt.xlabel("Time", fontsize=large)
+    plt.ylabel("Carbon Intensity (gCO2/kWh)", fontsize=large)
+    plt.xticks(fontsize=medium)
+    plt.yticks(fontsize=medium)
+    plt.grid(True)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+    plt.show()

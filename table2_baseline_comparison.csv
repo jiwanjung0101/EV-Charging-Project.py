@@ -1,0 +1,2 @@
+label,alpha,beta,v2g_enabled,total_energy_kWh,total_cost,total_emissions,avg_emission_per_kwh,status,cost_savings_pct,emission_reduction_pct
+Unmanaged,,,False,991.25,126.1881,116.69,0.1177,Baseline,0.0,0.0

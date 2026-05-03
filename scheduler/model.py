@@ -1,87 +1,86 @@
-# EV Charging Scheduler
 import pulp as lp
-from scheduler.ev import EV
 
-def run_scheduler(prices, carbon, time_slots, evs, interval_hours=0.5, carbon_price=0.05):
-    # Define the optimization model
+
+def run_scheduler(prices, carbon, time_slots, evs,
+                  interval_hours=0.5, alpha=1.0, beta=1.0,
+                  carbon_cap_fraction=0.85):
+    
     model = lp.LpProblem("EV_Scheduler", lp.LpMinimize)
 
-    # Decision variables: charging and discharging
+    # ── Decision variables ────────────────────────────────────────────────────
     c = lp.LpVariable.dicts(
         "charge",
         ((ev.name, t) for ev in evs for t in time_slots),
-        lowBound=0,
-        cat="Continuous"
+        lowBound=0, cat="Continuous"
     )
     d = lp.LpVariable.dicts(
         "discharge",
         ((ev.name, t) for ev in evs for t in time_slots),
-        lowBound=0,
-        cat="Continuous"
+        lowBound=0, cat="Continuous"
     )
-    #potential V2V variables for future extension
-    """v = lp.LpVariable.dicts(
-        "v2v",
-        ((ev_i.name, ev_j.name, t)
-        for ev_i in evs
-        for ev_j in evs
-        if ev_i != ev_j
-        for t in time_slots),
-        lowBound=0,
-        cat="Continuous"
-    )"""
 
-    # Objective: minimize cost over all EVs and times, added carbon cost as a tax
+    # ── Normalise price and carbon to [0, 1] ─────────────────────────────────
+    p_min, p_max = min(prices.values()), max(prices.values())
+    c_min, c_max = min(carbon.values()), max(carbon.values())
+
+    price_norm  = {t: (prices[t] - p_min) / (p_max - p_min) for t in time_slots}
+    carbon_norm = {t: (carbon[t] - c_min) / (c_max - c_min) for t in time_slots}
+
+    # ── Objective: minimise weighted cost + carbon ────────────────────────────
     model += lp.lpSum(
-        ((prices[t] + carbon_price * carbon[t]) * c[(ev.name, t)] - prices[t] * d[(ev.name,t)]) * interval_hours  
-        for ev in evs for t in time_slots
+        (alpha * price_norm[t] + beta * carbon_norm[t])
+        * (c[(ev.name, t)] - d[(ev.name, t)])
+        * interval_hours
+        for ev in evs
+        for t in time_slots
     )
 
-    #Alternative objective with separate weighting for price and carbon
-    '''model += lp.lpSum(
-        (
-            alpha * prices[t] * (c[(ev.name, t)] - d[(ev.name, t)]) +
-            beta  * carbon[t] * c[(ev.name, t)]
-        ) * interval_hours
-        for ev in evs for t in time_slots
-    )'''
-
-    '''model += lp.lpSum(
-        carbon[t] * c[(ev.name, t)] * interval_hours
-        for ev in evs for t in time_slots
-    ) <= carbon_cap'''
-
-    # Constraints
-    # Gird power constrains
+    # ── Grid power limit ──────────────────────────────────────────────────────
     for t in time_slots:
-        model += lp.lpSum(c[(ev.name, t)] - d[(ev.name, t)] for ev in evs) <= 50.0
+        model += lp.lpSum(
+            c[(ev.name, t)] - d[(ev.name, t)] for ev in evs
+        ) <= 50.0
 
-    # EV constraints
+    # ── Global carbon cap ─────────────────────────────────────────────────────
+    # Baseline = every EV charges at max power for all its active slots.
+    # This gives a true worst-case emissions upper bound.
+    if carbon_cap_fraction is not None:
+        baseline_emissions = sum(
+            carbon[t] * ev.max_charging_power * interval_hours
+            for ev in evs
+            for t in ev.active_slots(time_slots)
+        )
+        model += lp.lpSum(
+            (c[(ev.name, t)] - d[(ev.name, t)]) * carbon[t] * interval_hours
+            for ev in evs
+            for t in time_slots
+        ) <= carbon_cap_fraction * baseline_emissions
+
+    # ── Per-EV battery dynamics ───────────────────────────────────────────────
     energy_vars = {}
     for ev in evs:
-        #only consider active slots
         active = ev.active_slots(time_slots)
-        
-        # Energy variable
+
         energy = lp.LpVariable.dicts(
-            f"Energy_{ev.name}",
-            active,
-            lowBound=0,
-            upBound=ev.battery_capacity
+            f"Energy_{ev.name}", active,
+            lowBound=0, upBound=ev.battery_capacity
         )
         energy_vars[ev.name] = energy
 
-        # Energy = arrival energy
+        # Initial state of charge
         model += energy[ev.arrival] == ev.arrival_energy
 
-        # Energy charge and discharge
+        # SOC evolution
         for prev_t, t in zip(active[:-1], active[1:]):
-            model += energy[t] == energy[prev_t] + (c[(ev.name, t)] - d[(ev.name, t)]) * interval_hours
-       
-        # energy departue >= desired energy
+            model += energy[t] == (
+                energy[prev_t]
+                + (c[(ev.name, t)] - d[(ev.name, t)]) * interval_hours
+            )
+
+        # Must meet desired energy at departure
         model += energy[ev.departure] >= ev.desired_energy
 
-        # No power outside arrival-departure with max limits
+        # Power limits: zero outside connection window, bounded inside
         for t in time_slots:
             if ev.is_active(t):
                 model += c[(ev.name, t)] <= ev.max_charging_power
@@ -89,24 +88,24 @@ def run_scheduler(prices, carbon, time_slots, evs, interval_hours=0.5, carbon_pr
             else:
                 model += c[(ev.name, t)] == 0
                 model += d[(ev.name, t)] == 0
-        
-        """
-        for prev_t, t in zip(active[:-1], active[1:]):
-            model += energy[t] == (
-                energy[prev_t]
-                + c[(ev.name, t)] * interval_hours
-                - d[(ev.name, t)] * interval_hours
-                - lp.lpSum(
-                    v[(ev.name, other.name, t)]
-                    for other in evs if other.name != ev.name
-                ) * interval_hours
-                + lp.lpSum(
-                    v[(other.name, ev.name, t)]
-                    for other in evs if other.name != ev.name
-                ) * interval_hours
-            )"""
 
-    # Solve
+    # ── Solve ─────────────────────────────────────────────────────────────────
     model.solve(lp.PULP_CBC_CMD(msg=0))
+    return c, d, energy_vars, lp.LpStatus[model.status]
 
-    return c, d, energy_vars
+
+def compute_metrics(prices, carbon, time_slots, c, d, evs, interval_hours=0.5):
+    total_cost = total_emissions = total_energy = 0.0
+
+    for ev in evs:
+        for t in ev.active_slots(time_slots):
+            cv  = c[(ev.name, t)].varValue or 0.0
+            dv  = d[(ev.name, t)].varValue or 0.0
+            net = (cv - dv) * interval_hours
+
+            total_cost      += net * prices[t]
+            total_emissions += net * carbon[t]
+            total_energy    += net
+
+    avg_intensity = total_emissions / total_energy if total_energy > 0 else 0.0
+    return total_cost, total_emissions, total_energy, avg_intensity

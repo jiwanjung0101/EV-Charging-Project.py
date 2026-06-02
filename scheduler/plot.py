@@ -1,424 +1,682 @@
 """
-scheduler/plot.py
+scheduler/plots.py
 
 All visualisation for the EV scheduler.
 
-Changes vs previous version
-────────────────────────────
-• plot_ev_energy   : combined single figure showing all 30 EVs as individual
-                     lines on one set of axes (replaces n-subplot layout).
-• plot_fleet_power : now split by node — one subplot per node showing
-                     per-EV net power and node aggregate.
-• plot_grid        : unchanged.
-• All other plots  : unchanged.
+Figures
+───────
+  plot_grid_positions  — pre-assignment: just nodes + EVs, no assignment lines
+  plot_grid            — post-assignment: nodes, EVs, and assignment lines
+  fig_cost_price_overlay   — per-node load vs LMP price  (cost-only scheme)
+  fig_carbon_overlay       — fleet load vs carbon intensity  (carbon-only)
+  fig_balanced_node_profiles — per-node net power  (balanced scheme)
+  fig_pareto               — Pareto frontier cost vs emissions
+  table_performance        — printed LaTeX table + saved CSV/tex
 
-Call `plot_all(...)` from main.py to generate everything in one shot.
+  plot_all  — master call: generates all plots + table
 """
 
 from __future__ import annotations
 
+import csv
+import os
 import math
 from collections import defaultdict
 
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-import matplotlib.patches as mpatches
-import numpy as np
-
-from scheduler.model import active_slots
 
 
-def _savefig(fig: plt.Figure, path: str):
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+
+
+# ── Save helper ───────────────────────────────────────────────────────────────
+
+def _save(fig: plt.Figure, path: str) -> None:
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     print(f"  saved -> {path}")
 
 
-# ── 1. Prices ─────────────────────────────────────────────────────────────────
+# ── Restore EV node IDs from an assignment log ────────────────────────────────
 
-def plot_prices(
-    prices:    dict[int, float],
-    time_list: list[int],
-    nodal_df=None,
-    save_path: str | None = "prices.png",
-) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.set_title("Nodal LMP Prices ($/kWh)")
-
-    if nodal_df is not None:
-        for node in nodal_df.columns:
-            ax.plot(time_list, [nodal_df.loc[t, node] for t in time_list],
-                    marker="o", markersize=3, label=node)
-
-    ax.plot(time_list, [prices[t] for t in time_list],
-            lw=2, ls="--", color="black", label="Mean (fallback)")
-
-    ax.set_xlabel("Period (hour)")
-    ax.set_ylabel("Price ($/kWh)")
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
-    ax.grid(True)
-    ax.legend()
-    fig.tight_layout()
-
-    if save_path:
-        _savefig(fig, save_path)
-    return fig
+def _restore_node_ids(evs, assignment_log: dict) -> None:
+    """Mutate the shared evs list so node_id matches a specific scheme's log."""
+    for ev in evs:
+        if ev.name in assignment_log:
+            ev.node_id = assignment_log[ev.name]["assigned"]
 
 
-# ── 2. Carbon intensity ───────────────────────────────────────────────────────
+# ── Shared: extract aggregate fleet net power per period ─────────────────────
 
-def plot_carbon(
-    carbon:    dict[int, float],
-    time_list: list[int],
-    save_path: str | None = "carbon.png",
-) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(10, 3.5))
-    ax.set_title("Carbon Intensity (g CO2/kWh)")
-
-    ax.plot(time_list, [carbon[t] for t in time_list],
-            marker="o", markersize=3, color="tab:orange")
-
-    ax.set_xlabel("Period (hour)")
-    ax.set_ylabel("g CO2/kWh")
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
-    ax.grid(True)
-    fig.tight_layout()
-
-    if save_path:
-        _savefig(fig, save_path)
-    return fig
+def _fleet_net_power(evs, c: dict, d: dict, time_list: list[int]) -> np.ndarray:
+    totals = np.zeros(len(time_list))
+    for i, t in enumerate(time_list):
+        for ev in evs:
+            if not (ev.arrival <= t <= ev.departure):
+                continue
+            raw_c = c.get((ev.name, t), 0.0)
+            raw_d = d.get((ev.name, t), 0.0)
+            cv = raw_c.varValue if hasattr(raw_c, "varValue") else raw_c
+            dv = raw_d.varValue if hasattr(raw_d, "varValue") else raw_d
+            totals[i] += (cv or 0.0) - (dv or 0.0)
+    return totals
 
 
-# ── 3. Per-EV power ───────────────────────────────────────────────────────────
+# ── Shared node colours (consistent across all figures) ──────────────────────
 
-def plot_ev_power(
+NODE_COLORS = [
+    "#2CA25F",  # node 0
+    "#E6550D",  # node 1
+    "#2171B5",  # node 2
+    "#C94040",  # node 3
+    "#7B55A8",  # node 4 (if present)
+]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig 0 — Pre-assignment grid: just node + EV locations, no lines
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plot_grid_positions(
     evs,
-    c, d,
-    time_list: list[int],
-    save_path: str | None = "ev_power.png",
+    charging_nodes,
+    save_path: str | None = "grid_positions.pdf",
 ) -> plt.Figure:
-    n = len(evs)
-    fig, axes = plt.subplots(n, 1, figsize=(10, 2.8 * n), sharex=True)
-    if n == 1:
+    """
+    Plain grid map showing where EVs and charging nodes sit.
+    No assignment lines — use this before assign_ev_nodes() is called,
+    or as a standalone position reference.
+    """
+    GRID = 10
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.set_xlim(0.5, GRID + 0.5)
+    ax.set_ylim(0.5, GRID + 0.5)
+    ax.set_xticks(range(1, GRID + 1))
+    ax.set_yticks(range(1, GRID + 1))
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.set_xlabel("Grid X")
+    ax.set_ylabel("Grid Y")
+    ax.set_title("EV and Charging Node Locations")
+    ax.set_aspect("equal")
+
+    # EVs — neutral grey
+    for ev in evs:
+        ax.scatter(
+            ev.grid_x, ev.grid_y,
+            s=110, color="#AAAAAA", alpha=0.85,
+            edgecolors="black", linewidths=0.5, zorder=2,
+        )
+        ax.annotate(
+            ev.name, (ev.grid_x, ev.grid_y),
+            xytext=(4, 4), textcoords="offset points",
+            fontsize=8, zorder=3,
+        )
+
+    # Charging nodes — coloured stars
+    for idx, node in enumerate(charging_nodes):
+        color = NODE_COLORS[idx % len(NODE_COLORS)]
+        ax.scatter(
+            node.grid_x, node.grid_y,
+            s=220, marker="*", color=color,
+            edgecolors="black", linewidths=0.8, zorder=5,
+        )
+        short = node.name.split("-")[0]
+        ax.annotate(
+            short, (node.grid_x, node.grid_y),
+            xytext=(0, 12), textcoords="offset points",
+            ha="center", fontsize=9, fontweight="bold",
+            color=color, zorder=6,
+        )
+
+    fig.tight_layout()
+    if save_path:
+        _save(fig, save_path)
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig — Post-assignment grid map with coloured assignment lines
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plot_grid(
+    evs,
+    charging_nodes,
+    assignment_log: dict,
+    save_path: str | None = "grid_map.pdf",
+) -> plt.Figure:
+    """
+    Grid map showing EV→node assignment lines.
+    EVs are coloured by their assigned node; nodes are coloured stars.
+    """
+    GRID = 10
+
+    node_map   = {cn.name: cn for cn in charging_nodes}
+    node_color = {
+        cn.name: NODE_COLORS[i % len(NODE_COLORS)]
+        for i, cn in enumerate(charging_nodes)
+    }
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.set_xlim(0.5, GRID + 0.5)
+    ax.set_ylim(0.5, GRID + 0.5)
+    ax.set_xticks(range(1, GRID + 1))
+    ax.set_yticks(range(1, GRID + 1))
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.set_xlabel("Grid X")
+    ax.set_ylabel("Grid Y")
+    ax.set_title("EV Charging Grid Assignment")
+    ax.set_aspect("equal")
+
+    # Assignment lines
+    for ev in evs:
+        assigned = assignment_log[ev.name]["assigned"]
+        cn = node_map.get(assigned)
+        if cn is None:
+            continue
+        ax.plot(
+            [ev.grid_x, cn.grid_x], [ev.grid_y, cn.grid_y],
+            ls="--", lw=1.0, color=node_color[assigned],
+            alpha=0.55, zorder=1,
+        )
+
+    # EVs — coloured by assigned node
+    for ev in evs:
+        assigned = assignment_log[ev.name]["assigned"]
+        color = node_color.get(assigned, "#AAAAAA")
+        ax.scatter(
+            ev.grid_x, ev.grid_y,
+            s=110, color=color, alpha=0.85,
+            edgecolors="black", linewidths=0.5, zorder=3,
+        )
+        ax.annotate(
+            ev.name, (ev.grid_x, ev.grid_y),
+            xytext=(4, 4), textcoords="offset points",
+            fontsize=8, zorder=4,
+        )
+
+    # Charging nodes — coloured stars
+    for idx, cn in enumerate(charging_nodes):
+        color = NODE_COLORS[idx % len(NODE_COLORS)]
+        ax.scatter(
+            cn.grid_x, cn.grid_y,
+            s=220, marker="*", color=color,
+            edgecolors="black", linewidths=0.8, zorder=5,
+        )
+        short = cn.name.split("-")[0]
+        ax.annotate(
+            short, (cn.grid_x, cn.grid_y),
+            xytext=(0, 12), textcoords="offset points",
+            ha="center", fontsize=9, fontweight="bold",
+            color=color, zorder=6,
+        )
+
+    fig.tight_layout()
+    if save_path:
+        _save(fig, save_path)
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig 1 — Per-node load vs LMP price  (cost-only scheme, α=1)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def fig_cost_price_overlay(
+    cost_result,
+    nodal_df,
+    time_list: list[int],
+    evs,
+    save_path: str | None = "fig_cost_price_overlay.pdf",
+) -> plt.Figure:
+    """
+    One subplot per charging node.
+      left  y-axis (line)  — aggregate net power of EVs at that node (kW)
+      right y-axis (line)  — that node's own LMP price ($/kWh)
+    """
+    _restore_node_ids(evs, cost_result.assignment_log)
+
+    node_evs: dict[str, list] = defaultdict(list)
+    for ev in evs:
+        node_evs[ev.node_id].append(ev)
+
+    nodes_sorted   = sorted(node_evs.keys())
+    n_nodes        = len(nodes_sorted)
+    color_charge   = "#2171B5"
+    color_price    = "#E6550D"
+
+    fig, axes = plt.subplots(n_nodes, 1, figsize=(9.5, 3.6 * n_nodes), sharex=True)
+    if n_nodes == 1:
         axes = [axes]
 
-    fig.suptitle("Per-EV Charge / Discharge Power (kW)")
+    fig.suptitle(
+        "Per-Node Aggregate Load vs Nodal LMP — Cost-Only Scheme ($\\alpha=1$)",
+        fontsize=11, y=1.01,
+    )
 
-    for ax, ev in zip(axes, evs):
-        slot_set = set(active_slots(ev, time_list))
+    for ax1, node_name in zip(axes, nodes_sorted):
+        evs_here  = node_evs[node_name]
+        node_load = np.zeros(len(time_list))
 
-        charge_vals, discharge_vals = [], []
-        for t in time_list:
-            if t in slot_set:
-                raw_c = c.get((ev.name, t), 0.0)
-                raw_d = d.get((ev.name, t), 0.0)
+        for ev in evs_here:
+            for i, t in enumerate(time_list):
+                if not (ev.arrival <= t <= ev.departure):
+                    continue
+                raw_c = cost_result.c.get((ev.name, t), 0.0)
+                raw_d = cost_result.d.get((ev.name, t), 0.0)
                 cv = raw_c.varValue if hasattr(raw_c, "varValue") else raw_c
                 dv = raw_d.varValue if hasattr(raw_d, "varValue") else raw_d
-                charge_vals.append(cv or 0.0)
-                discharge_vals.append(dv or 0.0)
-            else:
-                charge_vals.append(0.0)
-                discharge_vals.append(0.0)
+                node_load[i] += (cv or 0.0) - (dv or 0.0)
 
-        net_vals = [cv - dv for cv, dv in zip(charge_vals, discharge_vals)]
+        if node_name in nodal_df.columns:
+            node_price = np.array([
+                nodal_df.loc[t, node_name] if t in nodal_df.index else 0.0
+                for t in time_list
+            ])
+        else:
+            node_price = np.array([
+                nodal_df.loc[t].mean() if t in nodal_df.index else 0.0
+                for t in time_list
+            ])
 
-        ax.plot(time_list, charge_vals,                   marker="o", markersize=3,
-                label="Charge",    color="tab:blue")
-        ax.plot(time_list, [-v for v in discharge_vals],  marker="o", markersize=3,
-                label="Discharge", color="tab:red")
-        ax.plot(time_list, net_vals,                      marker="o", markersize=3,
-                label="Net",       color="tab:green", ls="--")
-        ax.axhline(0, color="black", lw=0.8)
+        ax1.plot(time_list, node_load, color=color_charge, lw=2.0,
+                 marker="o", markersize=3.5, label="Net load (kW)", zorder=3)
+        ax1.axhline(0, color="black", lw=0.7)
+        ax1.set_ylabel("Net Power (kW)", color=color_charge, fontsize=9)
+        ax1.tick_params(axis="y", labelcolor=color_charge)
+        ax1.set_xlim(time_list[0] - 0.5, time_list[-1] + 0.5)
+        ax1.grid(True, axis="y", alpha=0.3, zorder=0)
 
-        ax.set_ylabel("kW")
-        ax.set_title(
-            f"{ev.name}  (arr={ev.arrival}, dep={ev.departure}, node={ev.node_id})",
-            loc="left", fontsize=9,
-        )
-        ax.grid(True)
-        ax.legend(fontsize=8)
+        ax2 = ax1.twinx()
+        ax2.plot(time_list, node_price, color=color_price, lw=2.0,
+                 marker="o", markersize=3.5, label="Node LMP (\\$/kWh)", zorder=3)
+        ax2.set_ylabel("LMP (\\$/kWh)", color=color_price, fontsize=9)
+        ax2.tick_params(axis="y", labelcolor=color_price)
 
-    axes[-1].set_xlabel("Period (hour)")
+        short       = node_name.split("-")[0]
+        n_ev_label  = f"{len(evs_here)} EV{'s' if len(evs_here) != 1 else ''}"
+        ax1.set_title(f"Node: {short}  ({n_ev_label})", loc="left", fontsize=9)
+
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, fontsize=7.5, loc="upper right", framealpha=0.9)
+
+    axes[-1].set_xlabel("Period (hour)", fontsize=10)
     axes[-1].xaxis.set_major_locator(mticker.MultipleLocator(2))
     fig.tight_layout()
 
     if save_path:
-        _savefig(fig, save_path)
+        _save(fig, save_path)
     return fig
 
 
-# ── 4. Aggregate fleet power — split by node ──────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig 2 — Fleet load vs carbon intensity  (carbon-only scheme, β=1)
+# ═════════════════════════════════════════════════════════════════════════════
 
-def plot_fleet_power(
+def fig_carbon_overlay(
+    carbon_result,
+    carbon: dict[int, float],
+    time_list: list[int],
     evs,
-    c, d,
-    time_list:   list[int],
-    grid_cap_kw: float = 50.0,
-    save_path:   str | None = "fleet_power.png",
+    save_path: str | None = "fig_carbon_overlay.pdf",
 ) -> plt.Figure:
     """
-    One subplot per node.  Each subplot shows:
-      • A thin line per EV assigned to that node (net power)
-      • A thick dashed line for the node aggregate
-      • A red dotted line at grid_cap_kw
+    Twin-axis plot:
+      left  y-axis — aggregate fleet net power (kW)
+      right y-axis — grid carbon intensity (g CO₂/kWh)
     """
-    # Group EVs by node
+    _restore_node_ids(evs, carbon_result.assignment_log)
+
+    load    = _fleet_net_power(evs, carbon_result.c, carbon_result.d, time_list)
+    ci_vals = np.array([carbon.get(t, 0.0) for t in time_list])
+
+    color_load   = "#2CA25F"
+    color_carbon = "#E6550D"
+
+    fig, ax1 = plt.subplots(figsize=(8.5, 4.0))
+
+    ax1.plot(time_list, load, color=color_load, lw=2.0,
+             marker="o", markersize=3.5, label="Net load (kW)", zorder=3)
+    ax1.axhline(0, color="black", lw=0.7)
+    ax1.set_xlabel("Period (hour)", fontsize=11)
+    ax1.set_ylabel("Net Power (kW)", color=color_load, fontsize=11)
+    ax1.tick_params(axis="y", labelcolor=color_load)
+    ax1.xaxis.set_major_locator(mticker.MultipleLocator(2))
+    ax1.grid(True, axis="y", alpha=0.35, zorder=0)
+    ax1.set_xlim(time_list[0] - 0.5, time_list[-1] + 0.5)
+
+    ax2 = ax1.twinx()
+    ax2.plot(time_list, ci_vals, color=color_carbon, lw=2.0,
+             marker="o", markersize=4, label="Carbon intensity (g CO₂/kWh)", zorder=3)
+    ax2.set_ylabel("Carbon Intensity (g CO$_2$/kWh)", color=color_carbon, fontsize=11)
+    ax2.tick_params(axis="y", labelcolor=color_carbon)
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=9, framealpha=0.9)
+
+    ax1.set_title(
+        "Aggregate Fleet Load vs Carbon Intensity — Carbon-Only Scheme ($\\beta=1$)",
+        fontsize=11, pad=8,
+    )
+    fig.tight_layout()
+
+    if save_path:
+        _save(fig, save_path)
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig 3 — Per-node net power profiles  (balanced scheme, α=β=0.5)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def fig_balanced_node_profiles(
+    balanced_result,
+    time_list:   list[int],
+    evs,
+    grid_cap_kw: float = 75.0,
+    save_path:   str | None = "fig_balanced_node_profiles.pdf",
+) -> plt.Figure:
+    """
+    One subplot per node showing per-EV thin lines, node aggregate, and cap.
+    """
+    _restore_node_ids(evs, balanced_result.assignment_log)
+
     node_evs: dict[str, list] = defaultdict(list)
     for ev in evs:
         node_evs[ev.node_id].append(ev)
 
     nodes_sorted = sorted(node_evs.keys())
-    n_nodes = len(nodes_sorted)
+    n_nodes      = len(nodes_sorted)
 
-    fig, axes = plt.subplots(
-        n_nodes, 1,
-        figsize=(11, 3.5 * n_nodes),
-        sharex=True,
-    )
+    fig, axes = plt.subplots(n_nodes, 1, figsize=(9.5, 3.5 * n_nodes), sharex=True)
     if n_nodes == 1:
         axes = [axes]
 
-    fig.suptitle("Aggregate Fleet Net Power by Node (kW)", fontsize=12, y=1.01)
+    fig.suptitle(
+        "Per-Node Charging and Discharging Profiles — Balanced Scheme "
+        "($\\alpha = \\beta = 0.5$)",
+        fontsize=11, y=1.01,
+    )
+
+    EV_COLORS = plt.get_cmap("tab20")
 
     for ax, node_name in zip(axes, nodes_sorted):
         evs_here = node_evs[node_name]
-        node_total = np.zeros(len(time_list))
+        node_agg = np.zeros(len(time_list))
 
-        for ev in evs_here:
-            slot_set = set(active_slots(ev, time_list))
+        for color_idx, ev in enumerate(evs_here):
             net = []
             for t in time_list:
-                if t in slot_set:
-                    raw_c = c.get((ev.name, t), 0.0)
-                    raw_d = d.get((ev.name, t), 0.0)
+                if ev.arrival <= t <= ev.departure:
+                    raw_c = balanced_result.c.get((ev.name, t), 0.0)
+                    raw_d = balanced_result.d.get((ev.name, t), 0.0)
                     cv = raw_c.varValue if hasattr(raw_c, "varValue") else raw_c
                     dv = raw_d.varValue if hasattr(raw_d, "varValue") else raw_d
                     net.append((cv or 0.0) - (dv or 0.0))
                 else:
                     net.append(0.0)
             net = np.array(net)
-            node_total += net
-            ax.plot(time_list, net, lw=0.9, alpha=0.55,
-                    marker="o", markersize=2, label=ev.name)
+            node_agg += net
 
-        ax.plot(time_list, node_total, lw=2.2, ls="--", color="black",
-                marker="o", markersize=3, label="Node total")
-        ax.axhline(grid_cap_kw, color="tab:red", lw=1.4, ls=":",
-                   label=f"Node cap ({grid_cap_kw:.0f} kW)")
-        ax.axhline(0, color="black", lw=0.8)
+            ax.plot(
+                time_list, net, lw=0.9, alpha=0.55,
+                color=EV_COLORS(color_idx / max(len(evs_here) - 1, 1)),
+                marker="o", markersize=2, label=f"EV {ev.name}",
+            )
 
-        # Short node label for title
+        ax.plot(time_list, node_agg, lw=2.2, ls="--", color="black",
+                marker="o", markersize=3, label="Node total", zorder=5)
+        ax.axhline(grid_cap_kw, color="#C94040", lw=1.6, ls="--",
+                   label=f"Node cap ({grid_cap_kw:.0f} kW)", zorder=6)
+        ax.axhline(0, color="black", lw=0.7)
+
         short = node_name.split("-")[0]
         ax.set_title(
             f"Node: {short}  ({len(evs_here)} EV{'s' if len(evs_here) != 1 else ''})",
             loc="left", fontsize=9,
         )
-        ax.set_ylabel("Net power (kW)")
-        ax.grid(True)
-        ax.legend(ncol=4, fontsize=7)
+        ax.set_ylabel("Net Power (kW)", fontsize=9)
+        ax.grid(True, alpha=0.35)
+        ax.legend(ncol=5, fontsize=7, framealpha=0.85)
 
-    axes[-1].set_xlabel("Period (hour)")
+    axes[-1].set_xlabel("Period (hour)", fontsize=10)
     axes[-1].xaxis.set_major_locator(mticker.MultipleLocator(2))
     fig.tight_layout()
 
     if save_path:
-        _savefig(fig, save_path)
+        _save(fig, save_path)
     return fig
 
 
-# ── 5. Per-EV energy / SoC — all EVs on one combined chart ───────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Fig 4 — Pareto frontier: cost vs emissions
+# ═════════════════════════════════════════════════════════════════════════════
 
-def plot_ev_energy(
-    evs,
-    energy_vars: dict,
-    time_list:   list[int],
-    save_path:   str | None = "ev_energy.png",
+def fig_pareto(
+    pareto_points:  list,   # list[ParetoPoint]
+    scheme_results: list,   # list[SchemeResult] — for annotating key points
+    save_path:      str | None = "fig_pareto.pdf",
 ) -> plt.Figure:
     """
-    All EVs on a single axes — each EV is one line coloured by a continuous
-    palette so 30 lines are distinguishable.  Desired-energy and capacity
-    references are drawn as single horizontal bands using the fleet median
-    (to avoid 30 duplicate legend entries).
+    Scatter + line of (total_cost, total_emissions) as α varies 0 → 1.
+    The three managed operating points are annotated with distinct markers.
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.set_title("Per-EV Battery Energy — all EVs (kWh)", fontsize=12)
+    costs  = [p.total_cost      for p in pareto_points]
+    emits  = [p.total_emissions for p in pareto_points]
+    alphas = [p.alpha           for p in pareto_points]
 
-    cmap   = plt.get_cmap("tab20")
-    n_evs  = len(evs)
-    colors = [cmap(i / max(n_evs - 1, 1)) for i in range(n_evs)]
+    fig, ax = plt.subplots(figsize=(7.5, 5.0))
 
-    cap_vals     = [ev.battery_capacity for ev in evs]
-    desired_vals = [ev.desired_energy   for ev in evs]
+    sc = ax.scatter(costs, emits, c=alphas, cmap="RdYlGn_r",
+                    s=55, zorder=4, edgecolors="white", linewidths=0.5)
+    ax.plot(costs, emits, color="grey", lw=1.0, ls="--", zorder=3, alpha=0.7)
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label("$\\alpha$ (cost weight)", fontsize=9)
 
-    # Shaded bands for fleet capacity range and desired-energy range
-    ax.axhspan(min(desired_vals), max(desired_vals),
-               alpha=0.08, color="tab:orange", label="Desired energy range")
-    ax.axhspan(min(cap_vals), max(cap_vals),
-               alpha=0.05, color="tab:gray",   label="Capacity range")
+    MARKERS = {
+        1: ("Cost-only\n($\\alpha=1$)",           "^", "#1F78B4"),
+        2: ("Carbon-only\n($\\beta=1$)",           "v", "#33A02C"),
+        3: ("Balanced\n($\\alpha=\\beta=0.5$)",    "D", "#E31A1C"),
+    }
+    for idx, (label, marker, color) in MARKERS.items():
+        sr = scheme_results[idx]
+        ax.scatter(
+            sr.total_cost, sr.total_emissions,
+            marker=marker, s=140, color=color, zorder=6,
+            edgecolors="black", linewidths=0.7, label=label,
+        )
 
-    for i, ev in enumerate(evs):
-        if ev.name not in energy_vars:
-            continue
+    ax.annotate(
+        "$\\alpha$ increases →",
+        xy=(costs[-1], emits[-1]),
+        xytext=(
+            costs[-1] - (max(costs) - min(costs)) * 0.3,
+            emits[-1] + (max(emits)  - min(emits))  * 0.06,
+        ),
+        fontsize=8, color="grey",
+        arrowprops=dict(arrowstyle="-|>", color="grey", lw=0.9),
+    )
 
-        energy = energy_vars[ev.name]
-
-        # Support both LP (LpVariable) and baseline (plain float) energy dicts
-        if isinstance(energy, dict):
-            slots  = sorted(energy.keys())
-            e_vals = []
-            for t in slots:
-                val = energy[t]
-                e_vals.append(val.varValue if hasattr(val, "varValue") else val)
-        else:
-            continue
-
-        ax.plot(slots, e_vals,
-                color=colors[i], lw=1.3, alpha=0.75,
-                marker="o", markersize=2.5,
-                label=ev.name)
-
-    ax.set_xlabel("Period (hour)")
-    ax.set_ylabel("Energy (kWh)")
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
-    ax.grid(True, alpha=0.4)
-
-    # Legend: keep EV lines + band entries; place outside plot if many EVs
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles=handles, labels=labels,
-              ncol=5, fontsize=7, loc="upper left",
-              bbox_to_anchor=(1.01, 1), borderaxespad=0)
-
+    ax.set_xlabel("Total Electricity Cost (\\$)", fontsize=11)
+    ax.set_ylabel("Total Carbon Emissions (g CO$_2$)", fontsize=11)
+    ax.set_title(
+        "Pareto Frontier: Cost vs Emissions\n"
+        "($\\alpha$ swept from 0 to 1, $\\beta = 1 - \\alpha$)",
+        fontsize=11,
+    )
+    ax.legend(fontsize=9, framealpha=0.9, loc="upper right")
+    ax.grid(True, alpha=0.35)
     fig.tight_layout()
 
     if save_path:
-        _savefig(fig, save_path)
+        _save(fig, save_path)
     return fig
 
 
-# ── 6. Grid map ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Table — Performance comparison across all 4 schemes
+# ═════════════════════════════════════════════════════════════════════════════
 
-_NODE_PALETTE = [
-    "#1D9E75", "#E07B39", "#3A7EBF", "#C94040", "#7B55A8",
-    "#B5860D", "#2AABB8", "#D45E9A", "#5E8C3A", "#7B6E5A",
-]
+def table_performance(
+    results:  list,   # list[SchemeResult], length 4
+    save_dir: str = ".",
+) -> str:
+    """
+    Prints a formatted performance table and saves:
+      performance_table.csv  — raw numbers
+      performance_table.tex  — ready-to-paste LaTeX table body
+    Returns the LaTeX string.
+    """
+    unmanaged = results[0]
 
+    def pct(val, base):
+        if abs(base) < 1e-9:
+            return "—"
+        return f"{(val - base) / abs(base) * 100:+.1f}\\%"
 
-def plot_grid(
-    evs,
-    charging_nodes,
-    assignment_log: dict,
-    save_path: str | None = "grid_map.png",
-) -> plt.Figure:
-    GRID = 10
+    rows = []
+    for sr in results:
+        rows.append({
+            "Scheme":          sr.label,
+            "Cost ($)":        f"{sr.total_cost:.2f}",
+            "Emissions (g)":   f"{sr.total_emissions:.2f}",
+            "Degradation ($)": f"{sr.total_deg:.2f}",
+            "Δ Cost":          pct(sr.total_cost,      unmanaged.total_cost),
+            "Δ Emissions":     pct(sr.total_emissions, unmanaged.total_emissions),
+            "Δ Deg":           pct(sr.total_deg,        unmanaged.total_deg),
+        })
 
-    node_map   = {cn.name: cn for cn in charging_nodes}
-    node_names = [cn.name for cn in charging_nodes]
-    node_color = {name: _NODE_PALETTE[i % len(_NODE_PALETTE)]
-                  for i, name in enumerate(node_names)}
+    os.makedirs(save_dir, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title("EV Charging Grid — Node Assignments", fontsize=13, pad=12)
+    csv_path = os.path.join(save_dir, "performance_table.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  saved -> {csv_path}")
 
-    for i in range(1, GRID + 2):
-        ax.axhline(i - 0.5, color="lightgrey", lw=0.6, zorder=0)
-        ax.axvline(i - 0.5, color="lightgrey", lw=0.6, zorder=0)
-
-    ax.set_xlim(0.5, GRID + 0.5)
-    ax.set_ylim(0.5, GRID + 0.5)
-    ax.set_xticks(range(1, GRID + 1))
-    ax.set_yticks(range(1, GRID + 1))
-    ax.set_xlabel("Grid X", fontsize=10)
-    ax.set_ylabel("Grid Y", fontsize=10)
-    ax.set_aspect("equal")
-
-    for ev in evs:
-        assigned = assignment_log[ev.name]["assigned"]
-        cn       = node_map.get(assigned)
-        if cn is None:
-            continue
-        color = node_color[assigned]
-        dist  = math.sqrt((ev.grid_x - cn.grid_x) ** 2 +
-                          (ev.grid_y - cn.grid_y) ** 2)
-        mx = (ev.grid_x + cn.grid_x) / 2
-        my = (ev.grid_y + cn.grid_y) / 2
-
-        ax.plot(
-            [ev.grid_x, cn.grid_x], [ev.grid_y, cn.grid_y],
-            ls="--", lw=0.9, color=color, alpha=0.55, zorder=1,
-        )
-        ax.text(
-            mx, my, f"{dist:.1f}",
-            fontsize=6.5, color=color, ha="center", va="center",
-            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7),
-            zorder=2,
-        )
-
-    for ev in evs:
-        assigned = assignment_log[ev.name]["assigned"]
-        color    = node_color.get(assigned, "grey")
-        ax.scatter(ev.grid_x, ev.grid_y, s=120, color=color,
-                   edgecolors="white", linewidths=0.8, zorder=3)
-        ax.text(ev.grid_x, ev.grid_y, ev.name,
-                fontsize=5.5, ha="center", va="center",
-                color="white", fontweight="bold", zorder=4)
-
-    for cn in charging_nodes:
-        color = node_color[cn.name]
-        short = cn.name.split("-")[0].split("_")[-1]
-        ax.scatter(cn.grid_x, cn.grid_y, s=380, color=color, marker="*",
-                   edgecolors="white", linewidths=0.9, zorder=5)
-        ax.text(cn.grid_x, cn.grid_y + 0.42, short,
-                fontsize=7, ha="center", va="bottom",
-                color=color, fontweight="bold", zorder=6)
-
-    legend_handles = [
-        mpatches.Patch(color=node_color[cn.name],
-                       label=f"{cn.name.split('-')[0]}  ({cn.grid_x},{cn.grid_y})")
-        for cn in charging_nodes
+    latex_lines = [
+        r"\begin{table}[H]",
+        r"\centering",
+        r"\caption{Performance Comparison Across Scheduling Schemes}",
+        r"\label{tab:performance}",
+        r"\begin{tabular}{lrrrrrrr}",
+        r"\toprule",
+        r"Scheme & Cost (\$) & Emiss.\ (g CO$_2$) & Deg.\ (\$)"
+        r" & $\Delta$Cost & $\Delta$Emiss. & $\Delta$Deg. \\",
+        r"\midrule",
     ]
-    legend_handles += [
-        plt.scatter([], [], s=120, color="grey",
-                    edgecolors="white", linewidths=0.8, label="EV (coloured by node)"),
-        plt.scatter([], [], s=380, color="grey", marker="*",
-                    edgecolors="white", linewidths=0.9, label="Charging node ★"),
-    ]
-    ax.legend(handles=legend_handles, fontsize=7.5,
-              loc="upper right", framealpha=0.9, title="Nodes", title_fontsize=8)
+    for r in rows:
+        latex_lines.append(
+            f"{r['Scheme']} & {r['Cost ($)']} & {r['Emissions (g)']} "
+            f"& {r['Degradation ($)']} & {r['Δ Cost']} & {r['Δ Emissions']} "
+            f"& {r['Δ Deg']} \\\\"
+        )
+    latex_lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    latex_str = "\n".join(latex_lines)
 
-    fig.tight_layout()
-    if save_path:
-        _savefig(fig, save_path)
-    return fig
+    tex_path = os.path.join(save_dir, "performance_table.tex")
+    with open(tex_path, "w") as f:
+        f.write(latex_str)
+    print(f"  saved -> {tex_path}")
+
+    print("\n── Performance Table ───────────────────────────────────────────────────")
+    header = (f"  {'Scheme':<34} {'Cost ($)':>10} {'Emiss.(g)':>12} "
+              f"{'Deg($)':>10} {'ΔCost':>8} {'ΔEmiss':>9} {'ΔDeg':>8}")
+    print(header)
+    print("  " + "─" * (len(header) - 2))
+    for r in rows:
+        print(
+            f"  {r['Scheme']:<34} {r['Cost ($)']:>10} {r['Emissions (g)']:>12} "
+            f"{r['Degradation ($)']:>10} {r['Δ Cost']:>8} {r['Δ Emissions']:>9} "
+            f"{r['Δ Deg']:>8}"
+        )
+    print()
+
+    return latex_str
 
 
-# ── Master call ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Master call
+# ═════════════════════════════════════════════════════════════════════════════
 
 def plot_all(
-    prices:          dict[int, float],
-    carbon:          dict[int, float],
-    time_list:       list[int],
+    results:        list,   # list[SchemeResult], length 4
+    pareto_points:  list,   # list[ParetoPoint]
     evs,
-    c, d,
-    energy_vars:     dict,
+    nodal_df,
+    carbon:         dict[int, float],
+    time_list:      list[int],
     charging_nodes,
-    assignment_log:  dict,
-    nodal_df=None,
-    nodal_prices:    dict | None = None,
-    interval_hours:  float = 1.0,
-    grid_cap_kw:     float = 50.0,
-    out_dir:         str   = ".",
+    grid_cap_kw:    float = 75.0,
+    out_dir:        str   = "plots",
 ) -> None:
-    """Generate and save all plots to `out_dir`."""
-    import os
+    """
+    Generate and save all figures + performance table to `out_dir`.
+
+      grid_positions.pdf            — pre-assignment node + EV locations
+      fig_grid_map.pdf              — post-assignment grid with assignment lines
+      fig_cost_price_overlay.pdf    — load vs LMP, cost-only scheme
+      fig_carbon_overlay.pdf        — load vs carbon intensity, carbon-only scheme
+      fig_balanced_node_profiles.pdf — per-node profiles, balanced scheme
+      fig_pareto.pdf                — Pareto frontier
+      performance_table.csv / .tex  — performance comparison table
+    """
     os.makedirs(out_dir, exist_ok=True)
     p = lambda name: os.path.join(out_dir, name)
 
-    print("\nGenerating plots...")
-    plot_prices(     prices, time_list, nodal_df=nodal_df,  save_path=p("prices.png"))
-    plot_carbon(     carbon, time_list,                     save_path=p("carbon.png"))
-    plot_ev_power(   evs, c, d, time_list,                  save_path=p("ev_power.png"))
-    plot_fleet_power(evs, c, d, time_list,
-                     grid_cap_kw=grid_cap_kw,               save_path=p("fleet_power.png"))
-    plot_ev_energy(  evs, energy_vars, time_list,           save_path=p("ev_energy.png"))
-    plot_grid(       evs, charging_nodes, assignment_log,   save_path=p("grid_map.png"))
-    print("Done.\n")
-    plt.show()
+    # unmanaged=results[0], cost=results[1], carbon=results[2], balanced=results[3]
+    cost_result     = results[1]
+    carbon_result   = results[2]
+    balanced_result = results[3]
+
+    print(f"\n{'='*60}")
+    print("  Generating figures …")
+    print(f"{'='*60}\n")
+
+    plot_grid_positions(
+        evs=evs, charging_nodes=charging_nodes,
+        save_path=p("grid_positions.pdf"),
+    )
+    plt.close("all")
+
+    plot_grid(
+        evs=evs, charging_nodes=charging_nodes,
+        assignment_log=balanced_result.assignment_log,
+        save_path=p("fig_grid_map.pdf"),
+    )
+    plt.close("all")
+
+    fig_cost_price_overlay(
+        cost_result=cost_result, nodal_df=nodal_df,
+        time_list=time_list, evs=evs,
+        save_path=p("fig_cost_price_overlay.pdf"),
+    )
+    plt.close("all")
+
+    fig_carbon_overlay(
+        carbon_result=carbon_result, carbon=carbon,
+        time_list=time_list, evs=evs,
+        save_path=p("fig_carbon_overlay.pdf"),
+    )
+    plt.close("all")
+
+    fig_balanced_node_profiles(
+        balanced_result=balanced_result, time_list=time_list,
+        evs=evs, grid_cap_kw=grid_cap_kw,
+        save_path=p("fig_balanced_node_profiles.pdf"),
+    )
+    plt.close("all")
+
+    fig_pareto(
+        pareto_points=pareto_points, scheme_results=results,
+        save_path=p("fig_pareto.pdf"),
+    )
+    plt.close("all")
+
+    table_performance(results=results, save_dir=out_dir)
+
+    print(f"\nAll outputs saved to '{out_dir}/'")

@@ -68,9 +68,9 @@ class EV:
     departure:             int
     arrival_energy:        float
     desired_energy:        float
-    battery_capacity:      float = 50.0
-    max_charging_power:    float = 11.0
-    max_discharging_power: float = 5.5
+    battery_capacity:      float = 40.0
+    max_charging_power:    float = 12.0
+    max_discharging_power: float = 4.0
     grid_x:                int   = field(default=0)   # from CSV column "X"
     grid_y:                int   = field(default=0)   # from CSV column "Y"
     node_id:               object = field(default=None)   # set by assign_ev_nodes
@@ -143,7 +143,7 @@ def load_carbon_intensity(
     return carbon, list(carbon.keys())
 
 
-def load_evs(filename: str = "ev_info.csv") -> list[EV]:
+def load_evs(filename: str = "ev_infoV5.csv") -> list[EV]:
     """
     Load EV fleet from CSV.  Columns expected:
       EV, Arrival Time, Departure Time, Arrival Energy, Desired Energy,
@@ -171,9 +171,9 @@ def load_evs(filename: str = "ev_info.csv") -> list[EV]:
             departure             = int(row["Departure Time"]),
             arrival_energy        = float(row["Arrival Energy"]),
             desired_energy        = float(row["Desired Energy"]),
-            battery_capacity      = float(row.get("Battery Capacity",      60.0)),
-            max_charging_power    = float(row.get("Max Charging Power",     7.4)),
-            max_discharging_power = float(row.get("Max Discharging Power",  3.7)),
+            battery_capacity      = float(row.get("Battery Capacity",      40.0)),
+            max_charging_power    = float(row.get("Max Charging Power",     12.0)),
+            max_discharging_power = float(row.get("Max Discharging Power",  4.0)),
             grid_x                = int(row["X"]),
             grid_y                = int(row["Y"]),
             node_id               = None,   # assigned by assign_ev_nodes()

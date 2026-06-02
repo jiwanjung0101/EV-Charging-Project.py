@@ -17,19 +17,25 @@ assign_ev_nodes
     fallbacks see an accurate picture of node load.
 
 run_scheduler
-  • Three families of *soft* slack variables replace hard constraints that
+  • *soft* slack variables replace hard constraints that
     could make the LP infeasible:
+      slack_carbon for carbon-cap excess (g CO₂)
 
-      slack_soc[ev]          – SOC-at-departure shortfall (kWh)
-      slack_cap[(node, t)]   – node power-cap excess (kW)
-      slack_carbon           – carbon-cap excess (g CO₂)
-
-  • Each slack is penalised at PENALTY (default 1 × 10⁶) in the objective,
+  • The slack is penalised at PENALTY (default 1e6) in the objective,
     making constraint violation extremely expensive without ever making the
     LP infeasible.  The solver always returns "Optimal".
 
   • After solving, any nonzero slack values are printed as warnings so the
     operator knows which constraints were soft-violated and by how much.
+
+  • carbon_cap_fraction is now scaled by beta via _effective_carbon_cap():
+      beta = 0   → cap disabled entirely (None)
+      beta = 0–1 → cap interpolated between 1.0 (uncapped) and the supplied
+                   carbon_cap_fraction value
+      beta ≥ 1   → cap held at carbon_cap_fraction (no further tightening
+                   beyond the supplied value)
+    This ensures the carbon cap and the carbon term in the objective always
+    express the same level of environmental concern.
 """
 
 from __future__ import annotations
@@ -38,12 +44,11 @@ import pulp as lp
 import pandas as pd
 
 
-# ── Penalty weight for soft constraints ───────────────────────────────────────
+# Penalty weight for soft constraints
 PENALTY: float = 1e6
 
 
-# ── EV helpers ────────────────────────────────────────────────────────────────
-
+# EV helpers
 def active_slots(ev, time_list: list) -> list:
     return [t for t in time_list if ev.arrival <= t <= ev.departure]
 
@@ -51,8 +56,45 @@ def is_active(ev, t: int) -> bool:
     return ev.arrival <= t <= ev.departure
 
 
-# ── Node assignment ───────────────────────────────────────────────────────────
+# Beta-scaled carbon cap
+def _effective_carbon_cap(
+    beta: float,
+    carbon_cap_fraction: float | None,
+) -> float | None:
+    """
+    Derive the effective carbon-cap fraction from the operator's carbon
+    preference weight (beta) and the configured cap.
 
+    Behaviour
+    ─────────
+    beta = 0          → returns None  (cap fully disabled; no carbon concern)
+    0 < beta < 1      → interpolates between 1.0 (uncapped) and the supplied
+                        carbon_cap_fraction, so the cap relaxes as beta falls
+    beta ≥ 1          → returns carbon_cap_fraction unchanged (full cap)
+    cap is None       → returns None  (caller disabled cap unconditionally)
+
+    Interpolation formula
+    ─────────────────────
+    effective = 1.0 - beta * (1.0 - carbon_cap_fraction)
+
+    Examples with carbon_cap_fraction = 0.85
+      beta = 0.0  →  None   (disabled)
+      beta = 0.5  →  0.925  (halfway between uncapped and full cap)
+      beta = 1.0  →  0.850  (full cap)
+      beta = 2.0  →  0.850  (clamped; cap never tightens past supplied value)
+    """
+    if carbon_cap_fraction is None:
+        return None
+    if beta <= 0.0:
+        return None
+    if beta >= 1.0:
+        return carbon_cap_fraction
+
+    # Linear interpolation: beta=0 → 1.0 (no cap), beta=1 → carbon_cap_fraction
+    return 1.0 - beta * (1.0 - carbon_cap_fraction)
+
+
+# Node assignment
 def assign_ev_nodes(
     evs,
     nodal_df:         pd.DataFrame,
@@ -95,7 +137,7 @@ def assign_ev_nodes(
     nodes  = nodal_df.columns.tolist()
     ev_map = {ev.name: ev for ev in evs}
 
-    # ── Distance helper ───────────────────────────────────────────────────────
+    # Distance helper
     def _within_distance(ev, node: str) -> bool:
         """True if no distance cap is set, or EV is within max_distance of node."""
         if max_distance is None or node_positions is None:
@@ -114,7 +156,7 @@ def assign_ev_nodes(
         )
         return nodes
 
-    # ── Normalisation bounds ──────────────────────────────────────────────────
+    # Normalisation bounds
     all_prices_flat = nodal_df.values.flatten()
     p_min, p_max    = float(all_prices_flat.min()), float(all_prices_flat.max())
     p_range         = p_max - p_min + 1e-12
@@ -129,7 +171,7 @@ def assign_ev_nodes(
     node_counts:    dict[str, int] = {node: 0 for node in nodes}
     assigned:       set[str]       = set()
 
-    # ── Score all eligible (EV, node) pairs ───────────────────────────────────
+    # Score all eligible (EV, node) pairs 
     candidates: list[tuple[float, str, str]] = []
 
     for ev in evs:
@@ -155,7 +197,7 @@ def assign_ev_nodes(
 
     candidates.sort(key=lambda x: x[0])
 
-    # ── Primary greedy assignment ─────────────────────────────────────────────
+    # Primary greedy assignment 
     for score, ev_name, node in candidates:
         if ev_name in assigned:
             continue
@@ -182,7 +224,7 @@ def assign_ev_nodes(
 
         _do_assign(ev, node, slots, committed, assignment_log, node_counts, assigned)
 
-    # ── Fallback pass — headroom-aware, distance-filtered ─────────────────────
+    # Fallback pass — headroom-aware, distance-filtered
     for ev in evs:
         if ev.name in assigned:
             continue
@@ -214,7 +256,7 @@ def assign_ev_nodes(
             f"fallback to {best_node} (headroom={best_headroom:.1f} kWh)"
         )
 
-    # ── Build nodal prices dict ───────────────────────────────────────────────
+    # Build nodal prices dict
     nodal_prices: dict = {
         (node, int(t)): float(nodal_df.loc[t, node])
         for node in nodes
@@ -234,21 +276,20 @@ def _do_assign(ev, node, slots, committed, assignment_log, node_counts, assigned
         committed[(node, t)] = committed.get((node, t), 0.0) + ev.max_charging_power
 
 
-# ── LP scheduler ──────────────────────────────────────────────────────────────
-
+# LP scheduler
 def run_scheduler(
     prices:              dict[int, float],
     carbon:              dict[int, float],
     time_slots,
     evs,
     interval_hours:      float = 1.0,
-    alpha:               float = 1.0,
-    beta:                float = 1.0,
+    alpha:               float = 0.5,
+    beta:                float = 0.5,
     carbon_cap_fraction: float | None = 0.85,
     v2g_enabled:         bool  = True,
     eta_c:               float = 0.95,
     eta_d:               float = 0.95,
-    deg_cost:            float = 0.005,
+    deg_cost:            float = 0.02,
     nodal_prices:        dict  | None = None,
     grid_cap_kw:         float = 75.0,
 ):
@@ -269,12 +310,34 @@ def run_scheduler(
 
     After solving, any nonzero slacks are printed as warnings.
 
+    Beta-scaled carbon cap
+    ──────────────────────
+    The effective carbon cap is derived from beta via _effective_carbon_cap():
+      beta = 0  → cap disabled; carbon is irrelevant to both objective and cap
+      beta < 1  → cap relaxes proportionally (less concern → looser ceiling)
+      beta ≥ 1  → cap applied at the supplied carbon_cap_fraction
+
     Returns (c, d, energy_vars, solver_status_string).
     """
     model     = lp.LpProblem("EV_Scheduler", lp.LpMinimize)
     time_list = list(time_slots)
 
-    # ── Primary decision variables ────────────────────────────────────────────
+    # Derive effective carbon cap from beta
+    effective_carbon_cap = _effective_carbon_cap(beta, carbon_cap_fraction)
+    if carbon_cap_fraction is not None and effective_carbon_cap != carbon_cap_fraction:
+        if effective_carbon_cap is None:
+            print(
+                f"  ℹ Carbon cap disabled (beta={beta:.2f}; "
+                f"configured cap={carbon_cap_fraction} ignored)."
+            )
+        else:
+            print(
+                f"  ℹ Carbon cap relaxed by beta: "
+                f"configured={carbon_cap_fraction:.3f} → "
+                f"effective={effective_carbon_cap:.3f} (beta={beta:.2f})"
+            )
+
+    # Primary decision variables 
     c = lp.LpVariable.dicts(
         "charge",
         ((ev.name, t) for ev in evs for t in time_list),
@@ -286,12 +349,12 @@ def run_scheduler(
         lowBound=0, cat="Continuous",
     )
 
-    # ── Group EVs by node ─────────────────────────────────────────────────────
+    # Group EVs by node 
     node_ev_map: dict[str, list] = {}
     for ev in evs:
         node_ev_map.setdefault(ev.node_id, []).append(ev)
 
-    # ── Slack variables ───────────────────────────────────────────────────────
+    # Slack variables 
     slack_soc = lp.LpVariable.dicts(
         "slack_soc", [ev.name for ev in evs], lowBound=0,
     )
@@ -299,7 +362,7 @@ def run_scheduler(
     slack_cap = lp.LpVariable.dicts("slack_cap", cap_keys, lowBound=0)
     slack_carbon = lp.LpVariable("slack_carbon", lowBound=0)
 
-    # ── Price / carbon normalisation ──────────────────────────────────────────
+    # Price / carbon normalisation 
     def eff_price(ev, t):
         if nodal_prices is not None:
             return nodal_prices.get((ev.node_id, t), prices.get(t, 0.0))
@@ -319,7 +382,7 @@ def run_scheduler(
 
     deg_norm = deg_cost / (p_range + 1e-12)
 
-    # ── Objective ─────────────────────────────────────────────────────────────
+    # Objective 
     model += (
         lp.lpSum(
             (
@@ -335,7 +398,7 @@ def run_scheduler(
         + PENALTY * slack_carbon
     )
 
-    # ── Per-node grid-cap constraint (soft) ───────────────────────────────────
+    # Per-node grid-cap constraint (soft)
     for node_name, node_evs in node_ev_map.items():
         for t in time_list:
             model += (
@@ -344,8 +407,8 @@ def run_scheduler(
                 f"NodeCap_{node_name}_{t}",
             )
 
-    # ── Global carbon cap (soft) ──────────────────────────────────────────────
-    if carbon_cap_fraction is not None:
+    # Global carbon cap (soft, beta-scaled) 
+    if effective_carbon_cap is not None:
         baseline = sum(
             carbon[t] * ev.max_charging_power * interval_hours
             for ev in evs
@@ -356,11 +419,11 @@ def run_scheduler(
                 (c[(ev.name, t)] - d[(ev.name, t)]) * carbon[t] * interval_hours
                 for ev in evs
                 for t  in time_list
-            ) <= carbon_cap_fraction * baseline + slack_carbon,
+            ) <= effective_carbon_cap * baseline + slack_carbon,
             "CarbonCap",
         )
 
-    # ── Per-EV battery dynamics ───────────────────────────────────────────────
+    # Per-EV battery dynamics 
     energy_vars: dict = {}
     for ev in evs:
         slots = active_slots(ev, time_list)
@@ -404,12 +467,12 @@ def run_scheduler(
                 model += c[(ev.name, t)] == 0, f"AbsC_{ev.name}_{t}"
                 model += d[(ev.name, t)] == 0, f"AbsD_{ev.name}_{t}"
 
-    # ── Solve ─────────────────────────────────────────────────────────────────
+    # Solve
     model.solve(lp.PULP_CBC_CMD(msg=0))
     status = lp.LpStatus[model.status]
 
-    # ── Report soft-constraint violations ─────────────────────────────────────
-    _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, carbon_cap_fraction)
+    # Report soft-constraint violations 
+    _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, effective_carbon_cap)
 
     return c, d, energy_vars, status
 
@@ -455,7 +518,7 @@ def _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, carbon_c
     print()
 
 
-# ── Baseline scheme ───────────────────────────────────────────────────────────
+# Baseline scheme
 
 def run_baseline(
     evs,
@@ -520,7 +583,7 @@ def run_baseline(
     return c_base, d_base, energy_base, nodal_prices_b, assignment_log
 
 
-# ── Post-solve metrics ────────────────────────────────────────────────────────
+# Post-solve metrics
 
 def compute_metrics(
     prices:        dict[int, float],

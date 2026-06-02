@@ -38,11 +38,10 @@ class ChargingNode:
 
 # ── Edit these positions to move nodes on the grid ────────────────────────────
 CHARGING_NODES: list[ChargingNode] = [
-    ChargingNode("CLAP_BUNDLD-APND",            grid_x=2, grid_y=1),
-    ChargingNode("POD_DUTCH1_7_UNIT 1-APND",    grid_x=5, grid_y=4),
-    ChargingNode("POD_SLST13_2_SOLAR1-APND",    grid_x=4, grid_y=3),
-    ChargingNode("ALAMIT_2_PL1X3-APND",         grid_x=2, grid_y=9),
-    ChargingNode("POD_CRSTWD_6_KUMYAY-APND",    grid_x=4, grid_y=7),
+    ChargingNode("CLAP_BUNDLD-APND",            grid_x=3, grid_y=3),
+    ChargingNode("POD_DUTCH1_7_UNIT 1-APND",    grid_x=8, grid_y=3),
+    ChargingNode("POD_SLST13_2_SOLAR1-APND",    grid_x=3, grid_y=8),
+    ChargingNode("ALAMIT_2_PL1X3-APND",         grid_x=8, grid_y=8),
 ]
 
 
@@ -126,7 +125,7 @@ def load_nodal_prices(
 
 
 def load_carbon_intensity(
-    filename: str = "df_fuel_ckan.csv",
+    filename: str = "carbon_intensity.csv",
     periods: int = 24,
 ) -> tuple[dict[int, float], list[int]]:
     """
@@ -135,10 +134,10 @@ def load_carbon_intensity(
     """
     path = os.path.join(DATA_DIR, filename)
     df = pd.read_csv(path)
-    df = df.iloc[300338 : 300338 + periods * 2 : 2].reset_index(drop=True).head(periods)
+    df = df.iloc[:24].reset_index(drop=True)
 
     df["Period"]           = range(1, periods + 1)
-    df["CARBON_INTENSITY"] = df["CARBON_INTENSITY"] / 1_000.0   # g/MWh → g/kWh
+    df["CARBON_INTENSITY"] = df["CARBON_INTENSITY"]*3.6
 
     carbon = dict(zip(df["Period"], df["CARBON_INTENSITY"]))
     return carbon, list(carbon.keys())

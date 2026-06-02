@@ -6,6 +6,11 @@ Node assignment pre-step + LP-based EV charging / V2G scheduler.
 Feasibility guarantees (vs previous version)
 ─────────────────────────────────────────────
 assign_ev_nodes
+  • Nodes further than max_distance grid units from an EV are excluded from
+    both the primary scoring pass and the fallback pass.  If no node falls
+    within range (edge case), the constraint is relaxed with a warning rather
+    than leaving the EV unassigned.
+
   • Fallback now selects the node with the most remaining energy headroom
     over the EV's active window — not just the least-populated node.
   • Committed power is updated even for fallback assignments so subsequent
@@ -34,8 +39,6 @@ import pandas as pd
 
 
 # ── Penalty weight for soft constraints ───────────────────────────────────────
-# Large enough to dominate the normalised cost/carbon objective, small enough
-# to keep CBC numerically well-conditioned.
 PENALTY: float = 1e6
 
 
@@ -60,31 +63,58 @@ def assign_ev_nodes(
     max_evs_per_node: int | None = None,   # kept for API compat, ignored
     grid_cap_kw:      float = 50.0,
     interval_hours:   float = 1.0,
+    node_positions:   dict[str, tuple[float, float]] | None = None,
+    max_distance:     float | None = 3.5,
 ) -> tuple[dict, dict]:
     """
-    Capacity-aware greedy node assignment.
+    Capacity-aware greedy node assignment with optional distance cap.
+
+    DISTANCE FILTER  ← new
+    ───────────────
+    Before scoring, each (EV, node) pair is checked against max_distance.
+    Nodes further than max_distance grid units from the EV are skipped in
+    both the primary and fallback passes.  If no node is reachable (edge
+    case), the distance constraint is relaxed for that EV with a warning.
 
     PRIMARY PASS
     ────────────
-    Score every (EV, node) pair; sort ascending (cheapest + greenest first).
-    Assign greedily subject to TWO checks:
+    Score every eligible (EV, node) pair; sort ascending (cheapest + greenest
+    first).  Assign greedily subject to TWO checks:
 
       1. Peak-power: committed[node, t] + ev.max_charging_power ≤ grid_cap_kw
          for every active slot t.
       2. Energy-throughput: remaining deliverable energy at the node ≥ energy
          the EV still needs (accounts for charging efficiency).
 
-    FALLBACK PASS  ← fixed vs previous version
+    FALLBACK PASS
     ─────────────
-    Any EV that failed all nodes in the primary pass is assigned to the node
-    that has the *most remaining energy headroom* over the EV's active window.
-    This minimises — rather than ignores — node overload.  Committed power is
-    updated after each fallback so later fallbacks see accurate load.
+    Any EV that failed all nodes in the primary pass is assigned to the
+    reachable node with the most remaining energy headroom.  Committed power
+    is updated after each fallback so later fallbacks see accurate load.
     """
     nodes  = nodal_df.columns.tolist()
     ev_map = {ev.name: ev for ev in evs}
 
-    # Normalisation bounds
+    # ── Distance helper ───────────────────────────────────────────────────────
+    def _within_distance(ev, node: str) -> bool:
+        """True if no distance cap is set, or EV is within max_distance of node."""
+        if max_distance is None or node_positions is None:
+            return True
+        nx, ny = node_positions.get(node, (0.0, 0.0))
+        return math.sqrt((ev.grid_x - nx) ** 2 + (ev.grid_y - ny) ** 2) <= max_distance
+
+    def _reachable_nodes(ev) -> list[str]:
+        """Return nodes within distance cap; fall back to all nodes with warning."""
+        within = [n for n in nodes if _within_distance(ev, n)]
+        if within:
+            return within
+        print(
+            f"  ⚠ EV {ev.name}: no node within max_distance={max_distance} — "
+            f"distance constraint relaxed for this EV."
+        )
+        return nodes
+
+    # ── Normalisation bounds ──────────────────────────────────────────────────
     all_prices_flat = nodal_df.values.flatten()
     p_min, p_max    = float(all_prices_flat.min()), float(all_prices_flat.max())
     p_range         = p_max - p_min + 1e-12
@@ -93,14 +123,13 @@ def assign_ev_nodes(
     c_range         = c_max - c_min + 1e-12
 
     # committed[(node, t)] = sum of max_charging_power for EVs already assigned
-    # to this node whose active window covers period t
     committed: dict[tuple[str, int], float] = {}
 
     assignment_log: dict = {}
     node_counts:    dict[str, int] = {node: 0 for node in nodes}
     assigned:       set[str]       = set()
 
-    # ── Score all (EV, node) pairs ────────────────────────────────────────────
+    # ── Score all eligible (EV, node) pairs ───────────────────────────────────
     candidates: list[tuple[float, str, str]] = []
 
     for ev in evs:
@@ -109,8 +138,10 @@ def assign_ev_nodes(
             assignment_log[ev.name] = {"scores": {}}
             continue
 
+        reachable    = _reachable_nodes(ev)
         node_scores: dict[str, float] = {}
-        for node in nodes:
+
+        for node in reachable:
             score = 0.0
             for t in slots:
                 if t in nodal_df.index:
@@ -132,7 +163,7 @@ def assign_ev_nodes(
         ev    = ev_map[ev_name]
         slots = active_slots(ev, time_list)
 
-        # Check 1 — peak power: no slot exceeds node cap
+        # Check 1 — peak power
         power_ok = all(
             committed.get((node, t), 0.0) + ev.max_charging_power <= grid_cap_kw
             for t in slots
@@ -140,7 +171,7 @@ def assign_ev_nodes(
         if not power_ok:
             continue
 
-        # Check 2 — energy throughput: remaining deliverable ≥ energy needed
+        # Check 2 — energy throughput
         energy_needed = (ev.desired_energy - ev.arrival_energy) / 0.95
         deliverable   = sum(
             (grid_cap_kw - committed.get((node, t), 0.0)) * interval_hours
@@ -149,29 +180,26 @@ def assign_ev_nodes(
         if deliverable < energy_needed - 1e-6:
             continue
 
-        # Assign
         _do_assign(ev, node, slots, committed, assignment_log, node_counts, assigned)
 
-    # ── Fallback pass — headroom-aware ────────────────────────────────────────
-    # For each unassigned EV, pick the node whose total remaining energy
-    # headroom over the EV's active window is largest.  This minimises the
-    # magnitude of any soft-constraint violation in the LP.
+    # ── Fallback pass — headroom-aware, distance-filtered ─────────────────────
     for ev in evs:
         if ev.name in assigned:
             continue
 
         slots = active_slots(ev, time_list)
         if not slots:
-            # EV has no active slots; assign anywhere (LP will zero-out anyway)
             fallback = nodes[0]
             assignment_log[ev.name]["assigned"] = fallback
             ev.node_id = fallback
             node_counts[fallback] += 1
             continue
 
+        reachable     = _reachable_nodes(ev)
         best_node     = None
         best_headroom = -1.0
-        for node in nodes:
+
+        for node in reachable:
             headroom = sum(
                 max(0.0, grid_cap_kw - committed.get((node, t), 0.0)) * interval_hours
                 for t in slots
@@ -258,22 +286,17 @@ def run_scheduler(
         lowBound=0, cat="Continuous",
     )
 
-    # ── Group EVs by node (needed before building slack keys) ─────────────────
+    # ── Group EVs by node ─────────────────────────────────────────────────────
     node_ev_map: dict[str, list] = {}
     for ev in evs:
         node_ev_map.setdefault(ev.node_id, []).append(ev)
 
     # ── Slack variables ───────────────────────────────────────────────────────
-    # slack_soc[ev.name]  : kWh shortfall at departure  (SOC soft constraint)
     slack_soc = lp.LpVariable.dicts(
         "slack_soc", [ev.name for ev in evs], lowBound=0,
     )
-
-    # slack_cap[(node, t)] : kW excess above node cap  (power soft constraint)
     cap_keys  = [(node, t) for node in node_ev_map for t in time_list]
     slack_cap = lp.LpVariable.dicts("slack_cap", cap_keys, lowBound=0)
-
-    # slack_carbon : g CO₂ excess above carbon cap  (carbon soft constraint)
     slack_carbon = lp.LpVariable("slack_carbon", lowBound=0)
 
     # ── Price / carbon normalisation ──────────────────────────────────────────
@@ -296,7 +319,7 @@ def run_scheduler(
 
     deg_norm = deg_cost / (p_range + 1e-12)
 
-    # ── Objective: cost + carbon + degradation + soft-constraint penalties ────
+    # ── Objective ─────────────────────────────────────────────────────────────
     model += (
         lp.lpSum(
             (
@@ -307,11 +330,8 @@ def run_scheduler(
             for ev in evs
             for t  in time_list
         )
-        # SOC shortfall penalty
         + PENALTY * lp.lpSum(slack_soc[ev.name] for ev in evs)
-        # Node-cap excess penalty
         + PENALTY * lp.lpSum(slack_cap[k] for k in cap_keys)
-        # Carbon-cap excess penalty
         + PENALTY * slack_carbon
     )
 
@@ -367,7 +387,7 @@ def run_scheduler(
                 f"SOC_{ev.name}_{t}",
             )
 
-        # Departure SOC — SOFT via slack_soc
+        # Departure SOC — soft via slack_soc
         model += (
             energy[slots[-1]] + slack_soc[ev.name] >= ev.desired_energy,
             f"DepSOC_{ev.name}",
@@ -388,7 +408,7 @@ def run_scheduler(
     model.solve(lp.PULP_CBC_CMD(msg=0))
     status = lp.LpStatus[model.status]
 
-    # ── Report soft-constraint violations ────────────────────────────────────
+    # ── Report soft-constraint violations ─────────────────────────────────────
     _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, carbon_cap_fraction)
 
     return c, d, energy_vars, status
@@ -420,7 +440,6 @@ def _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, carbon_c
             print(f"      EV {ev_name:<6s}  short by {val:.3f} kWh")
 
     if cap_viols:
-        # Summarise by node rather than printing every (node, t) pair
         node_max: dict[str, float] = {}
         for (node, t), val in cap_viols.items():
             node_max[node] = max(node_max.get(node, 0.0), val)

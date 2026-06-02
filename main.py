@@ -25,8 +25,9 @@ def main(
     eta_c:               float = 0.95,
     eta_d:               float = 0.95,
     deg_cost:            float = 0.02,
-    grid_cap_kw:         float = 50.0,   # ← updated from 50
+    grid_cap_kw:         float = 75.0,
     interval_hours:      float = 1.0,
+    max_distance:        float | None = 4,   # ← max grid-unit distance EV→node
 ) -> None:
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
@@ -36,6 +37,9 @@ def main(
 
     prices: dict[int, float] = nodal_df.mean(axis=1).to_dict()
     print(f"Loaded {len(evs)} EVs, {len(nodes)} nodes, {len(time_list)} periods.")
+    if max_distance is not None:
+        print(f"Distance cap: {max_distance} grid units  "
+              f"(EVs will not be assigned to nodes further than this.)")
 
     # ── 1a. Grid positions ────────────────────────────────────────────────────
     print("\nCharging node grid positions:")
@@ -54,6 +58,8 @@ def main(
         alpha=alpha, beta=beta,
         grid_cap_kw=grid_cap_kw,
         interval_hours=interval_hours,
+        node_positions=node_positions,
+        max_distance=max_distance,
     )
 
     print("\nNode assignments (optimised):")
@@ -77,8 +83,13 @@ def main(
         d         = dist(ev, node_name)
         dists.append(d)
         nx, ny    = node_positions.get(node_name, ("?", "?"))
+        over_cap  = (
+            f"  ⚠ >{max_distance}"
+            if max_distance is not None and d > max_distance
+            else ""
+        )
         print(f"  EV {ev.name:<3s}  ({ev.grid_x},{ev.grid_y}){'':>5}  "
-              f"{node_name:<40s}  ({nx},{ny}){'':>3}  {d:>6.2f}")
+              f"{node_name:<40s}  ({nx},{ny}){'':>3}  {d:>6.2f}{over_cap}")
     avg_dist_opt = sum(dists) / len(dists)
     print(f"  {'─'*76}")
     print(f"  Fleet average distance (optimised): {avg_dist_opt:.4f} grid units\n")
@@ -141,7 +152,7 @@ def main(
     print(f"  {'Avg EV–node distance':<28} {avg_dist_opt:>12.4f} {avg_dist_base:>12.4f} {pct(avg_dist_opt,avg_dist_base):>8}")
     print("══════════════════════════════════════════════════════════════\n")
 
-    # ── 7. Baseline assignments ───────────────────────────────────────────────
+    # ── 6. Baseline assignments ───────────────────────────────────────────────
     print("Baseline node assignments (closest node):")
     for ev in evs:
         bn    = assignment_log_base[ev.name]["assigned"]
@@ -151,7 +162,7 @@ def main(
               f"  →  {bn:<40s}  ({nx},{ny})  dist={d_:.2f}")
     print(f"  Fleet average distance (baseline): {avg_dist_base:.4f} grid units\n")
 
-    # ── 8. Plots ──────────────────────────────────────────────────────────────
+    # ── 7. Plots ──────────────────────────────────────────────────────────────
     plot_all(
         prices=prices, carbon=carbon, time_list=time_list, evs=evs,
         c=c, d=d, energy_vars=energy_vars,

@@ -17,16 +17,20 @@ assign_ev_nodes
     fallbacks see an accurate picture of node load.
 
 run_scheduler
-  • *soft* slack variables replace hard constraints that
+  • One *soft* slack variable replaces the hard carbon-cap constraint that
     could make the LP infeasible:
       slack_carbon for carbon-cap excess (g CO₂)
+
+    The SOC departure and node-cap constraints are now hard; infeasibility
+    from those will surface as a solver error rather than being silently
+    absorbed.
 
   • The slack is penalised at PENALTY (default 1e6) in the objective,
     making constraint violation extremely expensive without ever making the
     LP infeasible.  The solver always returns "Optimal".
 
-  • After solving, any nonzero slack values are printed as warnings so the
-    operator knows which constraints were soft-violated and by how much.
+  • After solving, any nonzero slack_carbon value is printed as a warning so
+    the operator knows the carbon cap was soft-violated and by how much.
 
   • carbon_cap_fraction is now scaled by beta via _effective_carbon_cap():
       beta = 0   → cap disabled entirely (None)
@@ -171,7 +175,7 @@ def assign_ev_nodes(
     node_counts:    dict[str, int] = {node: 0 for node in nodes}
     assigned:       set[str]       = set()
 
-    # Score all eligible (EV, node) pairs 
+    # Score all eligible (EV, node) pairs
     candidates: list[tuple[float, str, str]] = []
 
     for ev in evs:
@@ -197,7 +201,7 @@ def assign_ev_nodes(
 
     candidates.sort(key=lambda x: x[0])
 
-    # Primary greedy assignment 
+    # Primary greedy assignment
     for score, ev_name, node in candidates:
         if ev_name in assigned:
             continue
@@ -296,19 +300,21 @@ def run_scheduler(
     """
     Solve the EV charging / V2G LP.
 
-    Guaranteed feasibility
-    ──────────────────────
-    Three sets of non-negative slack variables soften the constraints that
-    could otherwise make the problem infeasible:
+    Soft vs hard constraints
+    ────────────────────────
+    Only the carbon cap is softened with a slack variable:
 
-      • slack_soc[ev]        softens  energy[last_slot] ≥ desired_energy
-      • slack_cap[node, t]   softens  Σ(c − d) ≤ grid_cap_kw  per node per t
-      • slack_carbon         softens  the global carbon cap
+      • slack_carbon  softens  the global carbon cap
 
-    Every unit of slack costs PENALTY = 1e6 in the objective, so the solver
-    uses slack only as a last resort and the LP always returns "Optimal".
+    The SOC departure and per-node grid-cap constraints are hard.  If the
+    problem data makes them simultaneously infeasible the solver will report
+    "Infeasible" rather than silently absorbing the violation.
 
-    After solving, any nonzero slacks are printed as warnings.
+    slack_carbon costs PENALTY = 1e6 per unit in the objective, so the solver
+    uses it only as a last resort and the LP always returns "Optimal" when
+    only the carbon cap is at risk.
+
+    After solving, any nonzero slack_carbon is printed as a warning.
 
     Beta-scaled carbon cap
     ──────────────────────
@@ -337,7 +343,7 @@ def run_scheduler(
                 f"effective={effective_carbon_cap:.3f} (beta={beta:.2f})"
             )
 
-    # Primary decision variables 
+    # Primary decision variables
     c = lp.LpVariable.dicts(
         "charge",
         ((ev.name, t) for ev in evs for t in time_list),
@@ -349,20 +355,15 @@ def run_scheduler(
         lowBound=0, cat="Continuous",
     )
 
-    # Group EVs by node 
+    # Group EVs by node
     node_ev_map: dict[str, list] = {}
     for ev in evs:
         node_ev_map.setdefault(ev.node_id, []).append(ev)
 
-    # Slack variables 
-    slack_soc = lp.LpVariable.dicts(
-        "slack_soc", [ev.name for ev in evs], lowBound=0,
-    )
-    cap_keys  = [(node, t) for node in node_ev_map for t in time_list]
-    slack_cap = lp.LpVariable.dicts("slack_cap", cap_keys, lowBound=0)
+    # Slack variable (carbon cap only)
     slack_carbon = lp.LpVariable("slack_carbon", lowBound=0)
 
-    # Price / carbon normalisation 
+    # Price / carbon normalisation
     def eff_price(ev, t):
         if nodal_prices is not None:
             return nodal_prices.get((ev.node_id, t), prices.get(t, 0.0))
@@ -382,7 +383,7 @@ def run_scheduler(
 
     deg_norm = deg_cost / (p_range + 1e-12)
 
-    # Objective 
+    # Objective
     model += (
         lp.lpSum(
             (
@@ -393,21 +394,19 @@ def run_scheduler(
             for ev in evs
             for t  in time_list
         )
-        + PENALTY * lp.lpSum(slack_soc[ev.name] for ev in evs)
-        + PENALTY * lp.lpSum(slack_cap[k] for k in cap_keys)
         + PENALTY * slack_carbon
     )
 
-    # Per-node grid-cap constraint (soft)
+    # Per-node grid-cap constraint (hard)
     for node_name, node_evs in node_ev_map.items():
         for t in time_list:
             model += (
                 lp.lpSum(c[(ev.name, t)] - d[(ev.name, t)] for ev in node_evs)
-                <= grid_cap_kw + slack_cap[(node_name, t)],
+                <= grid_cap_kw,
                 f"NodeCap_{node_name}_{t}",
             )
 
-    # Global carbon cap (soft, beta-scaled) 
+    # Global carbon cap (soft, beta-scaled)
     if effective_carbon_cap is not None:
         baseline = sum(
             carbon[t] * ev.max_charging_power * interval_hours
@@ -423,7 +422,7 @@ def run_scheduler(
             "CarbonCap",
         )
 
-    # Per-EV battery dynamics 
+    # Per-EV battery dynamics
     energy_vars: dict = {}
     for ev in evs:
         slots = active_slots(ev, time_list)
@@ -450,9 +449,9 @@ def run_scheduler(
                 f"SOC_{ev.name}_{t}",
             )
 
-        # Departure SOC — soft via slack_soc
+        # Departure SOC — hard constraint
         model += (
-            energy[slots[-1]] + slack_soc[ev.name] >= ev.desired_energy,
+            energy[slots[-1]] >= ev.desired_energy,
             f"DepSOC_{ev.name}",
         )
 
@@ -471,50 +470,22 @@ def run_scheduler(
     model.solve(lp.PULP_CBC_CMD(msg=0))
     status = lp.LpStatus[model.status]
 
-    # Report soft-constraint violations 
-    _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, effective_carbon_cap)
+    # Report soft-constraint violations
+    _report_carbon_violation(slack_carbon, effective_carbon_cap)
 
     return c, d, energy_vars, status
 
 
-def _report_violations(slack_soc, slack_cap, slack_carbon, grid_cap_kw, carbon_cap_fraction):
-    """Print a summary of any nonzero slack values after solving."""
-    soc_viols = {
-        ev_name: (var.varValue or 0.0)
-        for ev_name, var in slack_soc.items()
-        if (var.varValue or 0.0) > 1e-4
-    }
-    cap_viols = {
-        k: (var.varValue or 0.0)
-        for k, var in slack_cap.items()
-        if (var.varValue or 0.0) > 1e-4
-    }
+def _report_carbon_violation(slack_carbon, carbon_cap_fraction):
+    """Print a summary of any nonzero slack_carbon value after solving."""
     carbon_viol = slack_carbon.varValue or 0.0
 
-    if not soc_viols and not cap_viols and carbon_viol <= 1e-4:
-        print("  ✓ All hard constraints satisfied — no slack used.")
+    if carbon_viol <= 1e-4:
+        print("  ✓ Carbon cap satisfied — no slack used.")
         return
 
-    print("\n  ⚠  Soft-constraint violations (LP used slack to stay feasible):")
-
-    if soc_viols:
-        print(f"    SOC shortfall  ({len(soc_viols)} EV{'s' if len(soc_viols)>1 else ''}):")
-        for ev_name, val in sorted(soc_viols.items(), key=lambda x: -x[1]):
-            print(f"      EV {ev_name:<6s}  short by {val:.3f} kWh")
-
-    if cap_viols:
-        node_max: dict[str, float] = {}
-        for (node, t), val in cap_viols.items():
-            node_max[node] = max(node_max.get(node, 0.0), val)
-        print(f"    Node-cap excess  ({len(node_max)} node{'s' if len(node_max)>1 else ''}):")
-        for node, val in sorted(node_max.items(), key=lambda x: -x[1]):
-            short = node.split("-")[0]
-            print(f"      {short:<30s}  peak excess {val:.2f} kW  "
-                  f"(cap={grid_cap_kw:.0f} kW)")
-
-    if carbon_viol > 1e-4:
-        print(f"    Carbon cap exceeded by {carbon_viol:.2f} g CO₂")
-
+    print("\n  ⚠  Soft-constraint violation (LP used slack to stay feasible):")
+    print(f"    Carbon cap exceeded by {carbon_viol:.2f} g CO₂")
     print()
 
 

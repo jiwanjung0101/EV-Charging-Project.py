@@ -10,6 +10,15 @@ ChargingNode  : hardcoded (x, y) positions for the 5 charging nodes on the
                 10×10 grid.  Edit CHARGING_NODES below to move them.
 EV.grid_x/y   : loaded from the "X" and "Y" columns in ev_info.csv.
                  These are fixed values written into the CSV — not random.
+
+Nodal carbon intensity
+──────────────────────
+NODE_DATE_MAP assigns each charging node its own 24-hour carbon intensity
+schedule drawn from a different date in carbon_intensity.csv.
+
+▶  TO CHANGE WHICH DATE A NODE USES — edit NODE_DATE_MAP below.
+   Keys must match CHARGING_NODES names; values must be dates present in
+   carbon_intensity.csv (format: M/D/YYYY, e.g. "2/18/2026").
 """
 
 from __future__ import annotations
@@ -48,6 +57,27 @@ CHARGING_NODES: list[ChargingNode] = [
 def get_node_positions() -> dict[str, tuple[int, int]]:
     """Return {node_name: (grid_x, grid_y)} for all hardcoded charging nodes."""
     return {n.name: (n.grid_x, n.grid_y) for n in CHARGING_NODES}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ▶  NODE DATE MAP — edit here to change each node's carbon intensity schedule
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#   Keys   : must exactly match the node names in CHARGING_NODES above.
+#   Values : date strings in M/D/YYYY format that exist in carbon_intensity.csv.
+#            Available dates: 2/1/2026 through 2/28/2026.
+#
+#   Example: to give node 1 data from 2/1/2026 and node 2 data from 2/5/2026:
+#     "CLAP_BUNDLD-APND":         "2/1/2026",
+#     "POD_DUTCH1_7_UNIT 1-APND": "2/5/2026",
+#
+NODE_DATE_MAP: dict[str, str] = {
+    "CLAP_BUNDLD-APND":            "2/17/2026",
+    "POD_DUTCH1_7_UNIT 1-APND":    "2/18/2026",
+    "POD_SLST13_2_SOLAR1-APND":    "2/19/2026",
+    "ALAMIT_2_PL1X3-APND":         "2/20/2026",
+}
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 # ── EV data container ─────────────────────────────────────────────────────────
@@ -124,22 +154,82 @@ def load_nodal_prices(
     return df, selected, list(range(1, periods + 1))
 
 
+def load_nodal_carbon(
+    filename:      str                    = "carbon_intensity.csv",
+    periods:       int                    = 24,
+    node_date_map: dict[str, str] | None  = None,
+) -> dict[str, dict[int, float]]:
+    """
+    Load a per-node carbon intensity schedule from the multi-day CSV.
+
+    Each node in node_date_map gets the 24-hour AVG_EM_RATE profile for its
+    assigned date.  Values are converted from MTCO2e/MWh → g CO₂/kWh (×1 000).
+
+    Parameters
+    ----------
+    filename      : CSV file in DATA_DIR.  Must contain columns TRADE_DT,
+                    TRADE_HR, and AVG_EM_RATE.
+    periods       : number of hourly periods to load (default 24).
+    node_date_map : override for NODE_DATE_MAP; pass None to use the module-
+                    level constant (the normal case).
+
+    Returns
+    -------
+    dict[str, dict[int, float]]
+        {node_name: {period_1..24: g_CO2_per_kWh}}
+
+    ▶  To change which date each node uses, edit NODE_DATE_MAP above.
+    """
+    if node_date_map is None:
+        node_date_map = NODE_DATE_MAP
+
+    path = os.path.join(DATA_DIR, filename)
+    df   = pd.read_csv(path)
+
+    available_dates = set(df["TRADE_DT"].unique())
+
+    nodal_carbon: dict[str, dict[int, float]] = {}
+    for node_name, date_str in node_date_map.items():
+        if date_str not in available_dates:
+            raise ValueError(
+                f"Date '{date_str}' mapped to node '{node_name}' was not found "
+                f"in {filename}.\n"
+                f"Available dates: {sorted(available_dates)}"
+            )
+        day_df = (
+            df[df["TRADE_DT"] == date_str]
+            .sort_values("TRADE_HR")
+            .head(periods)
+            .reset_index(drop=True)
+        )
+        day_df = day_df.assign(Period=range(1, len(day_df) + 1))
+        # MTCO2e/MWh → g CO₂/kWh  (1 MTCO2e = 1 000 000 g; 1 MWh = 1 000 kWh)
+        nodal_carbon[node_name] = dict(
+            zip(day_df["Period"], day_df["AVG_EM_RATE"] * 1_000.0)
+        )
+
+    return nodal_carbon
+
+
 def load_carbon_intensity(
     filename: str = "carbon_intensity.csv",
-    periods: int = 24,
+    periods:  int = 24,
 ) -> tuple[dict[int, float], list[int]]:
     """
-    Returns carbon intensity dict {period: g CO₂/kWh} and period list.
-    Rows are subsampled so that 24 half-hourly rows → 24 hourly periods.
+    Legacy flat carbon intensity loader.
+
+    Returns the average g CO₂/kWh across all nodes in NODE_DATE_MAP for
+    each period — useful for quick diagnostics but not used by the main
+    pipeline, which calls load_nodal_carbon() instead.
     """
-    path = os.path.join(DATA_DIR, filename)
-    df = pd.read_csv(path)
-    df = df.iloc[:24].reset_index(drop=True)
-
-    df["Period"]           = range(1, periods + 1)
-    df["CARBON_INTENSITY"] = df["CARBON_INTENSITY"]*3.6
-
-    carbon = dict(zip(df["Period"], df["CARBON_INTENSITY"]))
+    nodal = load_nodal_carbon(filename=filename, periods=periods)
+    # Average across all nodes per period
+    n_nodes = len(nodal)
+    carbon: dict[int, float] = {}
+    for period in range(1, periods + 1):
+        carbon[period] = sum(
+            nc.get(period, 0.0) for nc in nodal.values()
+        ) / max(n_nodes, 1)
     return carbon, list(carbon.keys())
 
 

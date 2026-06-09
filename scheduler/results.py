@@ -17,6 +17,12 @@ Pareto sweep
   Each step re-runs nodal assignment + LP and records (total_cost,
   total_emissions).
 
+Nodal carbon
+────────────
+  carbon is now dict[str, dict[int, float]]  (node → {period → g CO₂/kWh}).
+  It is passed unchanged to assign_ev_nodes, run_scheduler, run_baseline,
+  and compute_metrics, all of which look up each EV's node's own schedule.
+
 Usage
 ─────
   from scheduler.results import run_all_schemes, SCHEME_LABELS
@@ -106,7 +112,7 @@ def _run_optimised_scheme(
     beta:                float,
     evs_orig,
     nodal_df:            pd.DataFrame,
-    carbon:              dict[int, float],
+    carbon:              dict[str, dict[int, float]],   # nodal
     time_list:           list[int],
     prices:              dict[int, float],
     node_positions:      dict,
@@ -164,7 +170,7 @@ def _run_optimised_scheme(
 def run_all_schemes(
     evs_orig,
     nodal_df:            pd.DataFrame,
-    carbon:              dict[int, float],
+    carbon:              dict[str, dict[int, float]],   # nodal
     time_list:           list[int],
     prices:              dict[int, float],
     # LP / assignment params forwarded to every run

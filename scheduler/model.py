@@ -3,43 +3,36 @@ scheduler/model.py
 
 Node assignment pre-step + LP-based EV charging / V2G scheduler.
 
-Feasibility guarantees (vs previous version)
-─────────────────────────────────────────────
+Nodal carbon intensity
+──────────────────────
+carbon is now dict[str, dict[int, float]]  (node_name → {period → g CO₂/kWh})
+instead of the previous flat dict[int, float].
+
+Every function that formerly received a global carbon dict now receives the
+nodal version and looks up the correct node's schedule wherever needed:
+
+  assign_ev_nodes : scoring uses carbon[node][t] for each (EV, node) pair
+  run_scheduler   : objective, carbon cap, and baseline all use carbon[ev.node_id][t]
+  compute_metrics : emissions use carbon[ev.node_id][t]
+
+Normalisation in both assign_ev_nodes and run_scheduler flattens all node
+schedules together so α/β weights are comparable across nodes.
+
+Feasibility guarantees (unchanged from previous version)
+─────────────────────────────────────────────────────────
 assign_ev_nodes
   • Nodes further than max_distance grid units from an EV are excluded from
-    both the primary scoring pass and the fallback pass.  If no node falls
-    within range (edge case), the constraint is relaxed with a warning rather
-    than leaving the EV unassigned.
+    both the primary scoring pass and the fallback pass.
 
-  • Fallback now selects the node with the most remaining energy headroom
-    over the EV's active window — not just the least-populated node.
-  • Committed power is updated even for fallback assignments so subsequent
-    fallbacks see an accurate picture of node load.
+  • Fallback selects the node with the most remaining energy headroom.
+  • Committed power is updated even for fallback assignments.
 
 run_scheduler
-  • One *soft* slack variable replaces the hard carbon-cap constraint that
-    could make the LP infeasible:
-      slack_carbon for carbon-cap excess (g CO₂)
-
-    The SOC departure and node-cap constraints are now hard; infeasibility
-    from those will surface as a solver error rather than being silently
-    absorbed.
-
-  • The slack is penalised at PENALTY (default 1e6) in the objective,
-    making constraint violation extremely expensive without ever making the
-    LP infeasible.  The solver always returns "Optimal".
-
-  • After solving, any nonzero slack_carbon value is printed as a warning so
-    the operator knows the carbon cap was soft-violated and by how much.
-
-  • carbon_cap_fraction is now scaled by beta via _effective_carbon_cap():
-      beta = 0   → cap disabled entirely (None)
-      beta = 0–1 → cap interpolated between 1.0 (uncapped) and the supplied
-                   carbon_cap_fraction value
-      beta ≥ 1   → cap held at carbon_cap_fraction (no further tightening
-                   beyond the supplied value)
-    This ensures the carbon cap and the carbon term in the objective always
-    express the same level of environmental concern.
+  • One soft slack variable (slack_carbon) softens the carbon-cap constraint.
+  • SOC departure and node-cap constraints are hard.
+  • PENALTY = 1e6 per unit of slack keeps the solver always returning Optimal.
+  • Nonzero slack is reported as a warning after solving.
+  • carbon_cap_fraction is beta-scaled via _effective_carbon_cap().
 """
 
 from __future__ import annotations
@@ -98,11 +91,18 @@ def _effective_carbon_cap(
     return 1.0 - beta * (1.0 - carbon_cap_fraction)
 
 
+# ── Internal helper: flatten nodal carbon to a list of all values ─────────────
+
+def _all_carbon_values(carbon: dict[str, dict[int, float]]) -> list[float]:
+    """Return every g CO₂/kWh value across all nodes and periods."""
+    return [v for nc in carbon.values() for v in nc.values()]
+
+
 # Node assignment
 def assign_ev_nodes(
     evs,
     nodal_df:         pd.DataFrame,
-    carbon:           dict[int, float],
+    carbon:           dict[str, dict[int, float]],   # nodal: {node → {t → g/kWh}}
     time_list:        list[int],
     alpha:            float = 1.0,
     beta:             float = 1.0,
@@ -115,7 +115,13 @@ def assign_ev_nodes(
     """
     Capacity-aware greedy node assignment with optional distance cap.
 
-    DISTANCE FILTER  ← new
+    carbon is now a nodal dict: {node_name: {period: g_CO2/kWh}}.
+    The scoring loop uses carbon[node][t] so each (EV, node) pair is evaluated
+    against that specific node's carbon schedule.
+
+    Normalisation spans all nodes and periods together so α/β are comparable.
+
+    DISTANCE FILTER
     ───────────────
     Before scoring, each (EV, node) pair is checked against max_distance.
     Nodes further than max_distance grid units from the EV are skipped in
@@ -143,14 +149,12 @@ def assign_ev_nodes(
 
     # Distance helper
     def _within_distance(ev, node: str) -> bool:
-        """True if no distance cap is set, or EV is within max_distance of node."""
         if max_distance is None or node_positions is None:
             return True
         nx, ny = node_positions.get(node, (0.0, 0.0))
         return math.sqrt((ev.grid_x - nx) ** 2 + (ev.grid_y - ny) ** 2) <= max_distance
 
     def _reachable_nodes(ev) -> list[str]:
-        """Return nodes within distance cap; fall back to all nodes with warning."""
         within = [n for n in nodes if _within_distance(ev, n)]
         if within:
             return within
@@ -160,13 +164,16 @@ def assign_ev_nodes(
         )
         return nodes
 
-    # Normalisation bounds
+    # Normalisation bounds — prices
     all_prices_flat = nodal_df.values.flatten()
     p_min, p_max    = float(all_prices_flat.min()), float(all_prices_flat.max())
     p_range         = p_max - p_min + 1e-12
-    c_vals          = list(carbon.values())
-    c_min, c_max    = min(c_vals), max(c_vals)
-    c_range         = c_max - c_min + 1e-12
+
+    # Normalisation bounds — carbon (flattened across ALL nodes and periods)
+    # Zero-based: c_max only.  See run_scheduler carbon_norm comment for why
+    # min-max normalisation causes carbon-only to behave incorrectly.
+    all_c_vals = _all_carbon_values(carbon)
+    c_max      = max(all_c_vals)
 
     # committed[(node, t)] = sum of max_charging_power for EVs already assigned
     committed: dict[tuple[str, int], float] = {}
@@ -188,11 +195,13 @@ def assign_ev_nodes(
         node_scores: dict[str, float] = {}
 
         for node in reachable:
+            # Use this node's own carbon schedule for scoring
+            node_carbon = carbon.get(node, {})
             score = 0.0
             for t in slots:
                 if t in nodal_df.index:
                     p_norm = (nodal_df.loc[t, node] - p_min) / p_range
-                    c_norm = (carbon.get(t, 0.0)    - c_min) / c_range
+                    c_norm = node_carbon.get(t, 0.0) / (c_max + 1e-12)
                     score += alpha * p_norm + beta * c_norm
             node_scores[node] = round(score, 4)
             candidates.append((score, ev.name, node))
@@ -283,7 +292,7 @@ def _do_assign(ev, node, slots, committed, assignment_log, node_counts, assigned
 # LP scheduler
 def run_scheduler(
     prices:              dict[int, float],
-    carbon:              dict[int, float],
+    carbon:              dict[str, dict[int, float]],   # nodal: {node → {t → g/kWh}}
     time_slots,
     evs,
     interval_hours:      float = 1.0,
@@ -300,28 +309,24 @@ def run_scheduler(
     """
     Solve the EV charging / V2G LP.
 
+    carbon is now dict[str, dict[int, float]]  (node_name → {period → g CO₂/kWh}).
+    Each EV's contribution to the objective, the carbon cap baseline, and the
+    cap constraint all use carbon[ev.node_id][t] so the LP correctly reflects
+    each node's own emission schedule.
+
     Soft vs hard constraints
     ────────────────────────
-    Only the carbon cap is softened with a slack variable:
+    Only the carbon cap is softened with a slack variable (slack_carbon).
+    SOC departure and per-node grid-cap constraints are hard.
 
-      • slack_carbon  softens  the global carbon cap
-
-    The SOC departure and per-node grid-cap constraints are hard.  If the
-    problem data makes them simultaneously infeasible the solver will report
-    "Infeasible" rather than silently absorbing the violation.
-
-    slack_carbon costs PENALTY = 1e6 per unit in the objective, so the solver
-    uses it only as a last resort and the LP always returns "Optimal" when
-    only the carbon cap is at risk.
-
-    After solving, any nonzero slack_carbon is printed as a warning.
+    slack_carbon costs PENALTY = 1e6 per unit; always returns Optimal.
+    Any nonzero slack is reported as a warning after solving.
 
     Beta-scaled carbon cap
     ──────────────────────
-    The effective carbon cap is derived from beta via _effective_carbon_cap():
-      beta = 0  → cap disabled; carbon is irrelevant to both objective and cap
-      beta < 1  → cap relaxes proportionally (less concern → looser ceiling)
-      beta ≥ 1  → cap applied at the supplied carbon_cap_fraction
+    beta = 0  → cap disabled
+    beta < 1  → cap relaxes proportionally
+    beta ≥ 1  → cap at carbon_cap_fraction
 
     Returns (c, d, energy_vars, solver_status_string).
     """
@@ -363,7 +368,7 @@ def run_scheduler(
     # Slack variable (carbon cap only)
     slack_carbon = lp.LpVariable("slack_carbon", lowBound=0)
 
-    # Price / carbon normalisation
+    # Price normalisation
     def eff_price(ev, t):
         if nodal_prices is not None:
             return nodal_prices.get((ev.node_id, t), prices.get(t, 0.0))
@@ -371,23 +376,45 @@ def run_scheduler(
 
     all_eff  = [eff_price(ev, t) for ev in evs for t in time_list]
     p_min, p_max = min(all_eff), max(all_eff)
-    c_min, c_max = min(carbon.values()), max(carbon.values())
     p_range  = p_max - p_min
-    c_range  = c_max - c_min
 
     def price_norm(ev, t):
         return (eff_price(ev, t) - p_min) / p_range if p_range > 1e-12 else 0.0
 
-    def carbon_norm(t):
-        return (carbon[t] - c_min) / c_range if c_range > 1e-12 else 0.0
+    # Carbon normalisation — flatten across all nodes and periods.
+    # Zero-based: divide by c_max, NOT (carbon - c_min) / c_range.
+    #
+    # Why this matters:
+    #   (carbon - c_min) / c_range  makes the minimum-carbon period appear
+    #   "free" in the LP objective (coefficient = 0).  With V2G enabled, the
+    #   LP exploits this by over-charging at that period then discharging
+    #   elsewhere, but those "free" kWh carry real emissions (c_min × kWh)
+    #   that the objective never sees.  Algebraically:
+    #     Objective_old  ≡  (Actual_Emissions − c_min × Net_Energy) / c_range
+    #   so carbon-only inadvertently rewards charging MORE, leading to higher
+    #   actual emissions than the balanced scheme.
+    #
+    #   carbon_t / c_max keeps every period proportional to real g CO₂/kWh:
+    #     Objective_new  ≡  Actual_Emissions / c_max
+    #   β=1 now genuinely minimises actual emissions; β=0 ignores carbon.
+    all_c = _all_carbon_values(carbon)
+    c_max = max(all_c)
+
+    def carbon_norm(ev, t):
+        """
+        Node-specific carbon intensity, normalised from zero.
+        Proportional to actual g CO₂/kWh so β=1 minimises actual emissions.
+        """
+        node_val = carbon.get(ev.node_id, {}).get(t, 0.0)
+        return node_val / c_max if c_max > 1e-12 else 0.0
 
     deg_norm = deg_cost / (p_range + 1e-12)
 
-    # Objective
+    # Objective — each EV's carbon term uses its own node's schedule
     model += (
         lp.lpSum(
             (
-                (alpha * price_norm(ev, t) + beta * carbon_norm(t))
+                (alpha * price_norm(ev, t) + beta * carbon_norm(ev, t))
                 * (c[(ev.name, t)] - d[(ev.name, t)])
                 + deg_norm * d[(ev.name, t)]
             ) * interval_hours
@@ -407,15 +434,18 @@ def run_scheduler(
             )
 
     # Global carbon cap (soft, beta-scaled)
+    # Baseline = sum over each EV of: its node's carbon[t] × max_charging_power
     if effective_carbon_cap is not None:
         baseline = sum(
-            carbon[t] * ev.max_charging_power * interval_hours
+            carbon.get(ev.node_id, {}).get(t, 0.0) * ev.max_charging_power * interval_hours
             for ev in evs
             for t  in active_slots(ev, time_list)
         )
         model += (
             lp.lpSum(
-                (c[(ev.name, t)] - d[(ev.name, t)]) * carbon[t] * interval_hours
+                (c[(ev.name, t)] - d[(ev.name, t)])
+                * carbon.get(ev.node_id, {}).get(t, 0.0)
+                * interval_hours
                 for ev in evs
                 for t  in time_list
             ) <= effective_carbon_cap * baseline + slack_carbon,
@@ -495,7 +525,7 @@ def run_baseline(
     evs,
     time_list:      list[int],
     nodal_df:       pd.DataFrame,
-    carbon:         dict[int, float],
+    carbon:         dict[str, dict[int, float]],   # nodal: {node → {t → g/kWh}}
     charging_nodes,
     prices:         dict[int, float],
     interval_hours: float = 1.0,
@@ -504,15 +534,18 @@ def run_baseline(
     """
     Baseline: assign each EV to its closest node, charge at max power until
     desired SOC is reached.  No LP, no V2G.
+
+    carbon is accepted for API consistency but not used in the baseline
+    charging logic; it is used by compute_metrics() called by the caller.
     """
-    node_map = {cn.name: cn for cn in charging_nodes}
+    import math as _math
 
     assignment_log: dict = {}
     for ev in evs:
         best_node, best_dist = None, float("inf")
         for cn in charging_nodes:
-            dist = math.sqrt((ev.grid_x - cn.grid_x) ** 2 +
-                             (ev.grid_y - cn.grid_y) ** 2)
+            dist = _math.sqrt((ev.grid_x - cn.grid_x) ** 2 +
+                              (ev.grid_y - cn.grid_y) ** 2)
             if dist < best_dist:
                 best_dist, best_node = dist, cn.name
         ev.node_id = best_node
@@ -523,7 +556,6 @@ def run_baseline(
     energy_base: dict = {}
 
     for ev in evs:
-        slots = active_slots(ev, time_list)
         soc   = ev.arrival_energy
         e_track: dict = {}
 
@@ -558,7 +590,7 @@ def run_baseline(
 
 def compute_metrics(
     prices:        dict[int, float],
-    carbon:        dict[int, float],
+    carbon:        dict[str, dict[int, float]],   # nodal: {node → {t → g/kWh}}
     time_slots,
     c, d, evs,
     interval_hours: float = 1.0,
@@ -570,6 +602,9 @@ def compute_metrics(
     """
     Returns (total_cost, total_emissions, total_energy, avg_intensity, total_deg).
     Works for both LP (LpVariable) and baseline (plain float) dicts.
+
+    Emissions for each EV at each period use that EV's assigned node's own
+    carbon intensity: carbon[ev.node_id][t].
     """
     total_cost = total_emissions = total_energy = total_deg = 0.0
 
@@ -589,8 +624,11 @@ def compute_metrics(
             else:
                 price_t = prices.get(t, 0.0)
 
+            # Use this EV's node's carbon schedule for emissions
+            carbon_t = carbon.get(ev.node_id, {}).get(t, 0.0)
+
             total_cost      += net_grid * price_t
-            total_emissions += net_grid * carbon.get(t, 0.0)
+            total_emissions += net_grid * carbon_t
             total_energy    += net_grid
             total_deg       += dv * interval_hours * deg_cost
 

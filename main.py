@@ -3,27 +3,29 @@ main.py — EV Charging Scheduler entry point.
 
 What this does
 ──────────────
-1. Load data (CAISO nodal prices, carbon intensity, EV fleet).
+1. Load data (CAISO nodal prices, per-node carbon intensity, EV fleet).
 
 2. Print grid positions for nodes and EVs.
 
 3. Run the balanced scheme (α = β = 0.5) as the primary schedule and print
-   the detailed per-EV report that was previously in the old main.py:
+   the detailed per-EV report:
      • node assignments + distances
      • full metric comparison against the unmanaged baseline
 
 4. Run all four evaluation schemes (Unmanaged, Cost-only, Carbon-only,
-   Balanced) and the Pareto sweep — previously in main_paper.py.
+   Balanced) and the Pareto sweep.
 
 5. Print the four-scheme summary table.
 
 6. Generate all figures and the performance table, saved to `out_dir`.
 
-Bug fix vs old code
-───────────────────
-The old main.py ran the LP with alpha=1.0, beta=1.0 (the function defaults)
-while claiming to show the "balanced" scheme, so results did not match
-main_paper.py's balanced run (α=β=0.5).  Both now use α=β=0.5 consistently.
+Nodal carbon intensity
+──────────────────────
+Carbon intensity is now per-node: each charging node uses the 24-hour
+AVG_EM_RATE profile from its assigned date in carbon_intensity.csv.
+
+▶  TO CHANGE WHICH DATE EACH NODE USES — open scheduler/data_loader.py
+   and edit the NODE_DATE_MAP dict near the top of the file.
 
 Parameters
 ──────────
@@ -35,9 +37,10 @@ import math
 
 from scheduler.data_loader import (
     load_nodal_prices,
-    load_carbon_intensity,
+    load_nodal_carbon,       # replaces load_carbon_intensity
     load_evs,
     CHARGING_NODES,
+    NODE_DATE_MAP,           # imported for display in startup banner
     get_node_positions,
 )
 from scheduler.model import (
@@ -65,7 +68,7 @@ CONFIG = dict(
     grid_cap_kw         = 85.0,   # per-node power cap (kW)
     interval_hours      = 1.0,
     max_distance        = 4.0,    # max EV-to-node Euclidean distance (grid units)
-    out_dir             = "paper_figures",
+    out_dir             = "plots",
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -83,14 +86,26 @@ def main() -> None:
         n_nodes=CONFIG["n_nodes"],
         periods=CONFIG["periods"],
     )
-    carbon, _ = load_carbon_intensity(periods=CONFIG["periods"])
-    evs       = load_evs()
 
+    # Load per-node carbon intensity (dict[str, dict[int, float]])
+    # Each node gets the 24-hour profile from its date in NODE_DATE_MAP.
+    # ▶ To change dates: edit NODE_DATE_MAP in scheduler/data_loader.py
+    carbon = load_nodal_carbon(periods=CONFIG["periods"])
+
+    evs           = load_evs()
     prices: dict[int, float] = nodal_df.mean(axis=1).to_dict()
-    node_positions            = get_node_positions()
+    node_positions = get_node_positions()
 
     print(f"Loaded {len(evs)} EVs, {len(nodes)} nodes, {len(time_list)} periods.")
     print(f"Distance cap: {CONFIG['max_distance']} grid units")
+
+    # Print which carbon date each node is using
+    print("\nPer-node carbon intensity dates (edit NODE_DATE_MAP in data_loader.py):")
+    for node_name, date_str in NODE_DATE_MAP.items():
+        if node_name in nodes:
+            vals = list(carbon[node_name].values())
+            print(f"  {node_name:<40s}  {date_str}  "
+                  f"(range: {min(vals):.0f}–{max(vals):.0f} g CO₂/kWh)")
 
     # ── 2. Grid positions ─────────────────────────────────────────────────────
     print("\nCharging node grid positions:")
@@ -220,9 +235,6 @@ def main() -> None:
     print("  Running all four schemes + Pareto sweep …")
     print("=" * 62)
 
-    # Reload evs so run_all_schemes gets a clean copy untouched by the
-    # detailed run above (run_all_schemes copies internally, but starting
-    # from clean data is safer)
     evs_fresh = load_evs()
 
     results, pareto_points = run_all_schemes(

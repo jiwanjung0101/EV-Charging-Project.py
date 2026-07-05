@@ -18,6 +18,17 @@ nodal version and looks up the correct node's schedule wherever needed:
 Normalisation in both assign_ev_nodes and run_scheduler flattens all node
 schedules together so α/β weights are comparable across nodes.
 
+Price normalisation (zero-based)
+─────────────────────────────────
+Both assign_ev_nodes and run_scheduler use  p / p_max  instead of
+(p − p_min) / p_range for the same reason carbon uses c / c_max:
+
+  Min-max normalisation makes the cheapest period appear "free" (coefficient
+  = 0) in the LP objective.  The solver then over-charges at that period
+  because it sees zero cost, even though real money is spent.  Zero-based
+  normalisation keeps every period proportional to its actual price so the LP
+  correctly trades off all periods.
+
 Feasibility guarantees (unchanged from previous version)
 ─────────────────────────────────────────────────────────
 assign_ev_nodes
@@ -120,6 +131,8 @@ def assign_ev_nodes(
     against that specific node's carbon schedule.
 
     Normalisation spans all nodes and periods together so α/β are comparable.
+    Both price and carbon use zero-based normalisation (value / max) so the
+    minimum-value period is never assigned a coefficient of zero in scoring.
 
     DISTANCE FILTER
     ───────────────
@@ -164,10 +177,13 @@ def assign_ev_nodes(
         )
         return nodes
 
-    # Normalisation bounds — prices
+    # Normalisation bounds — prices (zero-based: divide by p_max, not range).
+    # Min-max would assign a coefficient of 0 to the cheapest period, making
+    # it appear free in scoring and causing the greedy pass to over-assign EVs
+    # to that period.  Dividing by p_max keeps all periods proportional to
+    # their actual price.
     all_prices_flat = nodal_df.values.flatten()
-    p_min, p_max    = float(all_prices_flat.min()), float(all_prices_flat.max())
-    p_range         = p_max - p_min + 1e-12
+    p_max           = float(all_prices_flat.max())
 
     # Normalisation bounds — carbon (flattened across ALL nodes and periods)
     # Zero-based: c_max only.  See run_scheduler carbon_norm comment for why
@@ -200,7 +216,7 @@ def assign_ev_nodes(
             score = 0.0
             for t in slots:
                 if t in nodal_df.index:
-                    p_norm = (nodal_df.loc[t, node] - p_min) / p_range
+                    p_norm = nodal_df.loc[t, node] / (p_max + 1e-12)
                     c_norm = node_carbon.get(t, 0.0) / (c_max + 1e-12)
                     score += alpha * p_norm + beta * c_norm
             node_scores[node] = round(score, 4)
@@ -368,18 +384,31 @@ def run_scheduler(
     # Slack variable (carbon cap only)
     slack_carbon = lp.LpVariable("slack_carbon", lowBound=0)
 
-    # Price normalisation
+    # Price normalisation — zero-based: divide by p_max, not (p - p_min) / p_range.
+    #
+    # Why this matters (same reasoning as carbon):
+    #   (p - p_min) / p_range  makes the cheapest period appear "free" in the
+    #   LP objective (coefficient = 0).  With V2G enabled the LP exploits this
+    #   by over-charging at that period then discharging elsewhere, but those
+    #   "free" kWh carry a real cost (p_min × kWh) that the objective never
+    #   sees.  Algebraically:
+    #     Objective_old  ≡  (Actual_Cost − p_min × Net_Energy) / p_range
+    #   so price-only inadvertently rewards charging MORE, leading to higher
+    #   actual cost than the balanced scheme.
+    #
+    #   p / p_max keeps every period proportional to real $/kWh:
+    #     Objective_new  ≡  Actual_Cost / p_max
+    #   α=1 now genuinely minimises actual cost; α=0 ignores price.
     def eff_price(ev, t):
         if nodal_prices is not None:
             return nodal_prices.get((ev.node_id, t), prices.get(t, 0.0))
         return prices.get(t, 0.0)
 
-    all_eff  = [eff_price(ev, t) for ev in evs for t in time_list]
-    p_min, p_max = min(all_eff), max(all_eff)
-    p_range  = p_max - p_min
+    all_eff = [eff_price(ev, t) for ev in evs for t in time_list]
+    p_max   = max(all_eff)
 
     def price_norm(ev, t):
-        return (eff_price(ev, t) - p_min) / p_range if p_range > 1e-12 else 0.0
+        return eff_price(ev, t) / (p_max + 1e-12)
 
     # Carbon normalisation — flatten across all nodes and periods.
     # Zero-based: divide by c_max, NOT (carbon - c_min) / c_range.
@@ -408,7 +437,7 @@ def run_scheduler(
         node_val = carbon.get(ev.node_id, {}).get(t, 0.0)
         return node_val / c_max if c_max > 1e-12 else 0.0
 
-    deg_norm = deg_cost / (p_range + 1e-12)
+    deg_norm = deg_cost / (p_max + 1e-12)
 
     # Objective — each EV's carbon term uses its own node's schedule
     model += (

@@ -126,10 +126,6 @@ def fig_nodal_prices(
     time_list: list[int],
     save_path: str | None = "plots/fig_nodal_prices.pdf",
 ) -> plt.Figure:
-    """
-    One line per node showing its LMP price schedule ($/kWh).
-    No title — intended for direct inclusion in a research paper.
-    """
     fig, ax = plt.subplots(figsize=(8.5, 4.0))
 
     for idx, node_name in enumerate(nodal_df.columns):
@@ -416,8 +412,8 @@ def fig_carbon_overlay(
 
     nodes_sorted   = sorted(node_evs.keys())
     n_nodes        = len(nodes_sorted)
-    color_charge   = "#2CA25F"
-    color_carbon   = "#8B008B"
+    color_charge   = "#2171B5"
+    color_carbon    = "#2CA25F"
 
     fig, axes = plt.subplots(n_nodes, 1, figsize=(9.5, 3.6 * n_nodes), sharex=True)
     if n_nodes == 1:

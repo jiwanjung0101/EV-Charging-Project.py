@@ -1,15 +1,26 @@
-# EV Charging Project
+# A Locational Price and Carbon Intensity-Aware Charger Allocation and Charge–Discharge Scheduling Strategy for Eco-smart Electric Vehicles
 
-An EV charging scheduler that optimizes fleet charging schedules to trade off
-**electricity cost** against **carbon emissions**, using real CAISO nodal price
-data and per-node grid carbon intensity.
+Code and data for the paper *"A Locational Price and Carbon Intensity-Aware
+Charger Allocation and Charge–Discharge Scheduling Strategy for Eco-smart
+Electric Vehicles"* (Jung, Dash, and Srinivasan, 2026).
 
-Each EV is assigned to a charging node (subject to a distance cap and per-node
-power limits), then a linear program schedules charging — and optional
-vehicle-to-grid (V2G) discharging — over a 24-hour horizon. The model is
-evaluated under four schemes (Unmanaged baseline, Cost-only, Carbon-only,
-Balanced) plus a Pareto sweep, and all figures and summary tables are generated
+A multi-objective EV charging scheduler that trades off **electricity cost**
+against **carbon emissions** using real CAISO nodal price data and per-node grid
+carbon intensity. The two signals are combined into a single Integrated Charging
+Signal (ICS), weighted by α (cost) and β (carbon).
+
+The pipeline has two stages. First, a capacity-aware greedy procedure assigns
+each EV to a charging node subject to a distance cap, per-node power limits, and
+energy-throughput feasibility. Then a linear program schedules charging — and
+optional vehicle-to-grid (V2G) discharging — over a 24-hour horizon, with a
+linear battery-degradation cost and a soft, β-scaled carbon cap. The model is
+evaluated under four schemes (Uncoordinated baseline, Cost-only, Carbon-only,
+Balanced) plus a Pareto sweep, and all figures and tables are generated
 automatically.
+
+On a synthetic 30-EV fleet across 4 CAISO nodes, the balanced scheme (α = β =
+0.5) cuts electricity cost by 39.6% and carbon emissions by 21.6% relative to the
+uncoordinated baseline.
 
 ## Requirements
 
@@ -50,7 +61,7 @@ Edit the `CONFIG` block near the top of `main.py` to change global parameters:
 |---|---|
 | `n_nodes` | Number of CAISO nodes used |
 | `periods` | Scheduling horizon (hours) |
-| `carbon_cap_fraction` | Soft carbon cap as a fraction of the unmanaged baseline |
+| `carbon_cap_fraction` | Soft carbon cap as a fraction of the uncoordinated baseline |
 | `v2g_enabled` | Enable vehicle-to-grid discharging |
 | `eta_c` / `eta_d` | Charge / discharge efficiency |
 | `deg_cost` | Battery degradation cost ($/kWh discharged) |
@@ -60,6 +71,19 @@ Edit the `CONFIG` block near the top of `main.py` to change global parameters:
 
 **To change which carbon-intensity date each node uses**, edit the
 `NODE_DATE_MAP` dict near the top of `scheduler/data_loader.py`.
+
+The values used for the paper are: 30 EVs, 4 nodes, 24-hour horizon, node power
+cap 85 kW, max assignment distance 4.0 grid units, charge/discharge efficiency
+0.95, max charge 12 kW, max discharge 4 kW, degradation cost \$0.02/kWh, and a
+carbon-cap fraction of 0.85.
+
+## Data
+
+- **LMP prices** — CAISO day-ahead market via the Open Access Same-Time
+  Information System (OASIS), trade date Feb 18, 2026, for four nodes:
+  `CLAP_BUNDLD`, `POD_DUTCH1_7_UNIT 1`, `POD_SLST13_2_SOLAR1`, `ALAMIT_2_PL1X3`.
+- **Carbon intensity** — CAISO Average Emissions Rate report (Feb 2026); each
+  node is assigned one day's profile (Feb 17–20) via `NODE_DATE_MAP`.
 
 ## Project layout
 

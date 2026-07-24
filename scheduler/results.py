@@ -1,32 +1,8 @@
 """
-scheduler/results.py
-
-Runs all four evaluation schemes and the Pareto sweep, returning
-structured results for paper plots and the performance table.
-
-Schemes
-───────
-  0  Unmanaged   — greedy max-power charging, closest-node assignment
-  1  Cost-only   — α=1, β=0
-  2  Carbon-only — α=0, β=1
-  3  Balanced    — α=0.5, β=0.5
-
-Pareto sweep
-────────────
-  α swept from 0→1 in PARETO_STEPS uniform steps (β = 1 − α).
-  Each step re-runs nodal assignment + LP and records (total_cost,
-  total_emissions).
-
-Nodal carbon
-────────────
-  carbon is now dict[str, dict[int, float]]  (node → {period → g CO₂/kWh}).
-  It is passed unchanged to assign_ev_nodes, run_scheduler, run_baseline,
-  and compute_metrics, all of which look up each EV's node's own schedule.
-
-Usage
-─────
-  from scheduler.results import run_all_schemes, SCHEME_LABELS
-  results, pareto = run_all_schemes(...)
+Run the four evaluation schemes (Uncoordinated, Cost-only, Carbon-only,
+Balanced) and the Pareto sweep, returning structured results for the figures
+and the performance table. The sweep varies alpha from 0 to 1 in PARETO_STEPS
+steps (beta = 1 - alpha), re-running assignment + LP at each point.
 """
 
 from __future__ import annotations
@@ -44,19 +20,15 @@ from scheduler.model import (
 )
 from scheduler.data_loader import CHARGING_NODES, get_node_positions
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 
 SCHEME_LABELS: list[str] = [
-    "Unmanaged",
+    "Uncoordinated",
     "Cost-only (α=1, β=0)",
     "Carbon-only (α=0, β=1)",
     "Balanced (α=0.5, β=0.5)",
 ]
 
 PARETO_STEPS: int = 21   # α ∈ {0.00, 0.05, …, 1.00}
-
-
-# ── Result containers ─────────────────────────────────────────────────────────
 
 @dataclass
 class SchemeResult:
@@ -85,7 +57,7 @@ class ParetoPoint:
     total_emissions: float
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def _dist(ev, node_name: str, node_positions: dict) -> float:
     nx, ny = node_positions.get(node_name, (0, 0))
@@ -104,7 +76,7 @@ def _copy_evs(evs):
     return [copy.copy(ev) for ev in evs]
 
 
-# ── Core runner ───────────────────────────────────────────────────────────────
+# Core runner
 
 def _run_optimised_scheme(
     label:               str,
@@ -122,7 +94,7 @@ def _run_optimised_scheme(
     eta_c:               float  = 0.95,
     eta_d:               float  = 0.95,
     deg_cost:            float  = 0.02,
-    grid_cap_kw:         float  = 75.0,
+    grid_cap_kw:         float  = 85.0,
     interval_hours:      float  = 1.0,
     max_distance:        float | None = 4.0,
 ) -> SchemeResult:
@@ -165,7 +137,7 @@ def _run_optimised_scheme(
     )
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# Public API
 
 def run_all_schemes(
     evs_orig,
@@ -179,7 +151,7 @@ def run_all_schemes(
     eta_c:               float       = 0.95,
     eta_d:               float       = 0.95,
     deg_cost:            float       = 0.02,
-    grid_cap_kw:         float       = 75.0,
+    grid_cap_kw:         float       = 85.0,
     interval_hours:      float       = 1.0,
     max_distance:        float | None = 4.0,
 ) -> tuple[list[SchemeResult], list[ParetoPoint]]:
@@ -188,7 +160,7 @@ def run_all_schemes(
 
     Returns
     -------
-    results : list[SchemeResult]   length 4 — Unmanaged, Cost, Carbon, Balanced
+    results : list[SchemeResult]   length 4 — Uncoordinated, Cost, Carbon, Balanced
     pareto  : list[ParetoPoint]    length PARETO_STEPS
     """
     node_positions = get_node_positions()
@@ -203,8 +175,8 @@ def run_all_schemes(
         interval_hours=interval_hours, max_distance=max_distance,
     )
 
-    # ── Scheme 0: Unmanaged baseline ──────────────────────────────────────────
-    print("\n[Unmanaged] running baseline …")
+    # Scheme 0: Uncoordinated baseline
+    print("\n[Uncoordinated] running baseline …")
     evs_base = _copy_evs(evs_orig)
     c_base, d_base, energy_base, nodal_prices_b, alog_base = run_baseline(
         evs=evs_base, time_list=time_list, nodal_df=nodal_df, carbon=carbon,
@@ -220,26 +192,26 @@ def run_all_schemes(
     avg_dist_base = _avg_dist(evs_base, alog_base, node_positions)
 
     unmanaged = SchemeResult(
-        label="Unmanaged", alpha=float("nan"), beta=float("nan"),
+        label="Uncoordinated", alpha=float("nan"), beta=float("nan"),
         total_cost=tc, total_emissions=te, total_energy=tnrg,
         avg_intensity=ai, total_deg=tdeg, avg_dist=avg_dist_base,
         c=c_base, d=d_base, energy_vars=energy_base,
         nodal_prices=nodal_prices_b, assignment_log=alog_base,
     )
 
-    # ── Scheme 1: Cost-only ───────────────────────────────────────────────────
+    # Scheme 1: Cost-only
     print("\n[Cost-only] running …")
     cost_only = _run_optimised_scheme(
         label="Cost-only (α=1, β=0)", alpha=1.0, beta=0.0, **shared,
     )
 
-    # ── Scheme 2: Carbon-only ─────────────────────────────────────────────────
+    # Scheme 2: Carbon-only
     print("\n[Carbon-only] running …")
     carbon_only = _run_optimised_scheme(
         label="Carbon-only (α=0, β=1)", alpha=0.0, beta=1.0, **shared,
     )
 
-    # ── Scheme 3: Balanced ────────────────────────────────────────────────────
+    # Scheme 3: Balanced
     print("\n[Balanced] running …")
     balanced = _run_optimised_scheme(
         label="Balanced (α=0.5, β=0.5)", alpha=0.5, beta=0.5, **shared,
@@ -247,7 +219,7 @@ def run_all_schemes(
 
     results = [unmanaged, cost_only, carbon_only, balanced]
 
-    # ── Pareto sweep ──────────────────────────────────────────────────────────
+    # Pareto sweep
     print(f"\n[Pareto] sweeping α over {PARETO_STEPS} points …")
     pareto: list[ParetoPoint] = []
 

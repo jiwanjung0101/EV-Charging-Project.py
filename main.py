@@ -1,35 +1,10 @@
 """
-main.py — EV Charging Scheduler entry point.
+EV Charging Scheduler entry point.
 
-What this does
-──────────────
-1. Load data (CAISO nodal prices, per-node carbon intensity, EV fleet).
-
-2. Print grid positions for nodes and EVs.
-
-3. Run the balanced scheme (α = β = 0.5) as the primary schedule and print
-   the detailed per-EV report:
-     • node assignments + distances
-     • full metric comparison against the unmanaged baseline
-
-4. Run all four evaluation schemes (Unmanaged, Cost-only, Carbon-only,
-   Balanced) and the Pareto sweep.
-
-5. Print the four-scheme summary table.
-
-6. Generate all figures and the performance table, saved to `out_dir`.
-
-Nodal carbon intensity
-──────────────────────
-Carbon intensity is now per-node: each charging node uses the 24-hour
-AVG_EM_RATE profile from its assigned date in carbon_intensity.csv.
-
-▶  TO CHANGE WHICH DATE EACH NODE USES — open scheduler/data_loader.py
-   and edit the NODE_DATE_MAP dict near the top of the file.
-
-Parameters
-──────────
-Edit the CONFIG block below.  All parameters flow to every scheme run.
+Loads data, runs the balanced scheme as the primary schedule with a per-EV
+report, then runs all four schemes and the Pareto sweep, and generates the
+figures and performance table. Edit CONFIG below to change parameters, and
+NODE_DATE_MAP in scheduler/data_loader.py to change each node's carbon date.
 """
 
 from __future__ import annotations
@@ -37,10 +12,10 @@ import math
 
 from scheduler.data_loader import (
     load_nodal_prices,
-    load_nodal_carbon,       # replaces load_carbon_intensity
+    load_nodal_carbon,
     load_evs,
     CHARGING_NODES,
-    NODE_DATE_MAP,           # imported for display in startup banner
+    NODE_DATE_MAP,
     get_node_positions,
 )
 from scheduler.model import (
@@ -53,14 +28,11 @@ from scheduler.results import run_all_schemes
 from scheduler.plot import plot_all
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONFIG — edit here to change global parameters
-# ═══════════════════════════════════════════════════════════════════════════
-
+# CONFIG — global parameters, passed to every scheme run
 CONFIG = dict(
     n_nodes             = 4,      # number of CAISO nodes used
     periods             = 24,     # scheduling horizon (hours)
-    carbon_cap_fraction = 0.85,   # soft carbon cap as fraction of unmanaged baseline
+    carbon_cap_fraction = 0.85,   # soft carbon cap as fraction of uncoordinated baseline
     v2g_enabled         = True,
     eta_c               = 0.95,
     eta_d               = 0.95,
@@ -71,8 +43,6 @@ CONFIG = dict(
     out_dir             = "plots",
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def _dist(ev, node_name: str, node_positions: dict) -> float:
     nx, ny = node_positions.get(node_name, (0, 0))
@@ -81,15 +51,13 @@ def _dist(ev, node_name: str, node_positions: dict) -> float:
 
 def main() -> None:
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
+    # 1. Load data
     nodal_df, nodes, time_list = load_nodal_prices(
         n_nodes=CONFIG["n_nodes"],
         periods=CONFIG["periods"],
     )
 
-    # Load per-node carbon intensity (dict[str, dict[int, float]])
-    # Each node gets the 24-hour profile from its date in NODE_DATE_MAP.
-    # ▶ To change dates: edit NODE_DATE_MAP in scheduler/data_loader.py
+    # Per-node carbon intensity: each node uses its date from NODE_DATE_MAP.
     carbon = load_nodal_carbon(periods=CONFIG["periods"])
 
     evs           = load_evs()
@@ -107,7 +75,7 @@ def main() -> None:
             print(f"  {node_name:<40s}  {date_str}  "
                   f"(range: {min(vals):.0f}–{max(vals):.0f} g CO₂/kWh)")
 
-    # ── 2. Grid positions ─────────────────────────────────────────────────────
+    # 2. Grid positions
     print("\nCharging node grid positions:")
     for cn in CHARGING_NODES:
         if cn.name in nodes:
@@ -117,7 +85,7 @@ def main() -> None:
     for ev in evs:
         print(f"  EV {ev.name:<4s}  grid=({ev.grid_x}, {ev.grid_y})")
 
-    # ── 3. Balanced scheme: node assignment (α = β = 0.5) ────────────────────
+    # 3. Balanced scheme: node assignment (α = β = 0.5)
     alpha_bal = 0.5
     beta_bal  = 0.5
 
@@ -138,7 +106,7 @@ def main() -> None:
         print(f"  EV {ev_name:<4s} @ ({ev.grid_x},{ev.grid_y})"
               f"  →  {node}  @ {node_pos}")
 
-    # ── Distances (balanced) ──────────────────────────────────────────────────
+    # Distances (balanced)
     print("\n── EV → assigned node distances (balanced) ──────────────────────────")
     print(f"  {'EV':<6} {'EV pos':<10} {'Assigned node':<40} {'Node pos':<10} {'Dist':>6}")
     print(f"  {'-'*6} {'-'*10} {'-'*40} {'-'*10} {'-'*6}")
@@ -159,7 +127,7 @@ def main() -> None:
     print(f"  {'─'*76}")
     print(f"  Fleet average distance (balanced): {avg_dist_opt:.4f} grid units\n")
 
-    # ── 4. Unmanaged baseline ─────────────────────────────────────────────────
+    # 4. Uncoordinated baseline
     # Capture balanced assignments before baseline overwrites node_id
     opt_node_ids = {ev.name: ev.node_id for ev in evs}
 
@@ -182,7 +150,7 @@ def main() -> None:
     for ev in evs:
         ev.node_id = opt_node_ids[ev.name]
 
-    # ── 5. Balanced LP ────────────────────────────────────────────────────────
+    # 5. Balanced LP
     c, d, energy_vars, status = run_scheduler(
         prices=prices, carbon=carbon, time_slots=time_list, evs=evs,
         interval_hours=CONFIG["interval_hours"],
@@ -204,12 +172,12 @@ def main() -> None:
         deg_cost=CONFIG["deg_cost"], nodal_prices=nodal_prices,
     )
 
-    # ── 6. Balanced vs baseline comparison ───────────────────────────────────
+    # 6. Balanced vs baseline comparison
     def pct(opt, base):
         return f"{(opt - base) / abs(base) * 100:+.1f}%" if abs(base) > 1e-9 else "  n/a"
 
     print("\n══════════════════════════════════════════════════════════════")
-    print("  Balanced (α=β=0.5)  vs  Unmanaged baseline")
+    print("  Balanced (α=β=0.5)  vs  Uncoordinated baseline")
     print("══════════════════════════════════════════════════════════════")
     print(f"  {'Metric':<28} {'Balanced':>12} {'Baseline':>12} {'Δ':>8}")
     print(f"  {'-'*28} {'-'*12} {'-'*12} {'-'*8}")
@@ -230,7 +198,7 @@ def main() -> None:
               f"  →  {bn:<40s}  ({nx},{ny})  dist={d_:.2f}")
     print(f"  Fleet average distance (baseline): {avg_dist_base:.4f} grid units\n")
 
-    # ── 7. All four schemes + Pareto sweep ────────────────────────────────────
+    # 7. All four schemes + Pareto sweep
     print("=" * 62)
     print("  Running all four schemes + Pareto sweep …")
     print("=" * 62)
@@ -253,10 +221,10 @@ def main() -> None:
         max_distance        = CONFIG["max_distance"],
     )
 
-    # ── 8. Four-scheme summary ────────────────────────────────────────────────
+    # 8. Four-scheme summary
     unmanaged = results[0]
     print("\n══════════════════════════════════════════════════════════════════════")
-    print("  Summary — all four schemes vs unmanaged baseline")
+    print("  Summary — all four schemes vs uncoordinated baseline")
     print("══════════════════════════════════════════════════════════════════════")
     print(f"  {'Scheme':<34} {'Cost($)':>9} {'':>7} {'Emiss(g)':>11} {'':>7} {'Deg($)':>8}")
     print(f"  {'─'*34} {'─'*9} {'─'*7} {'─'*11} {'─'*7} {'─'*8}")
@@ -273,7 +241,7 @@ def main() -> None:
         )
     print()
 
-    # ── 9. Figures + performance table ───────────────────────────────────────
+    # 9. Figures + performance table
     plot_all(
         results        = results,
         pareto_points  = pareto_points,

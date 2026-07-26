@@ -535,12 +535,14 @@ def fig_pareto(
     save_path:      str | None = "plots/fig_pareto.pdf",
 ) -> plt.Figure:
     """
-    Scatter + line of (total_cost, total_emissions) as α varies 0 → 1.
+    Scatter + line of (total cost, total_emissions) as α varies 0 → 1.
+    Total cost is energy cost plus battery degradation — the quantity the LP
+    minimises — so the frontier is monotone in α.
     The three managed operating points are annotated with distinct markers.
     """
-    costs  = [p.total_cost      for p in pareto_points]
-    emits  = [p.total_emissions for p in pareto_points]
-    alphas = [p.alpha           for p in pareto_points]
+    costs  = [p.total_cost + p.total_deg for p in pareto_points]
+    emits  = [p.total_emissions          for p in pareto_points]
+    alphas = [p.alpha                    for p in pareto_points]
 
     fig, ax = plt.subplots(figsize=(7.5, 5.0))
 
@@ -558,12 +560,12 @@ def fig_pareto(
     for idx, (label, marker, color) in MARKERS.items():
         sr = scheme_results[idx]
         ax.scatter(
-            sr.total_cost, sr.total_emissions,
+            sr.total_cost + sr.total_deg, sr.total_emissions,
             marker=marker, s=140, color=color, zorder=6,
             edgecolors="black", linewidths=0.7, label=label,
         )
 
-    ax.set_xlabel("Total Electricity Cost (\\$)", fontsize=11)
+    ax.set_xlabel("Total Operating Cost (\\$) — energy + degradation", fontsize=11)
     ax.set_ylabel("Total Carbon Emissions (g CO$_2$)", fontsize=11)
     ax.legend(fontsize=9, framealpha=0.9, loc="upper right")
     ax.grid(True, alpha=0.35)
@@ -580,31 +582,46 @@ def table_performance(
     save_dir: str = "plots",
 ) -> str:
     """Print the performance table and save performance_table.csv and .tex.
-    Percentages are relative to the uncoordinated baseline (results[0])."""
-    baseline = results[0]
 
-    def pct(val, base):
+    Total cost is energy cost PLUS battery degradation, which is the quantity
+    the LP actually minimises. Reporting energy cost alone made the reported
+    figure non-monotone in alpha, because the LP is free to trade a little
+    energy cost against battery throughput. The two components are kept as
+    separate columns so the split stays visible.
+
+    Percentages are relative to the uncoordinated baseline (results[0]).
+    """
+    baseline      = results[0]
+    baseline_total = baseline.total_cost + baseline.total_deg
+
+    def pct(val, base, tex: bool = False):
         if abs(base) < 1e-9:
             return "—"
-        return f"{(val - base) / abs(base) * 100:+.1f}\\%"
+        pc = "\\%" if tex else "%"
+        return f"{(val - base) / abs(base) * 100:+.1f}{pc}"
 
     rows = []
     for sr in results:
+        total = sr.total_cost + sr.total_deg
         rows.append({
-            "Scheme":          sr.label,
-            "Cost ($)":        f"{sr.total_cost:.2f}",
-            "Emissions (g)":   f"{sr.total_emissions:.2f}",
-            "Degradation ($)": f"{sr.total_deg:.2f}",
-            "Δ Cost":          pct(sr.total_cost,      baseline.total_cost),
-            "Δ Emissions":     pct(sr.total_emissions, baseline.total_emissions),
-            "Δ Deg":           pct(sr.total_deg,        baseline.total_deg),
+            "Scheme":           sr.label,
+            "Total Cost ($)":   f"{total:.2f}",
+            "Energy ($)":       f"{sr.total_cost:.2f}",
+            "Degradation ($)":  f"{sr.total_deg:.2f}",
+            "Emissions (g)":    f"{sr.total_emissions:.2f}",
+            "Δ Cost":           pct(total, baseline_total),
+            "Δ Emissions":      pct(sr.total_emissions, baseline.total_emissions),
+            "Δ Cost tex":       pct(total, baseline_total, tex=True),
+            "Δ Emissions tex":  pct(sr.total_emissions, baseline.total_emissions, tex=True),
         })
 
     os.makedirs(save_dir, exist_ok=True)
 
+    csv_cols = ["Scheme", "Total Cost ($)", "Energy ($)", "Degradation ($)",
+                "Emissions (g)", "Δ Cost", "Δ Emissions"]
     csv_path = os.path.join(save_dir, "performance_table.csv")
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     print(f"  saved -> {csv_path}")
@@ -612,19 +629,21 @@ def table_performance(
     latex_lines = [
         r"\begin{table}[H]",
         r"\centering",
-        r"\caption{Performance Comparison Across Scheduling Schemes}",
+        r"\caption{Performance Comparison Across Scheduling Schemes. Total cost"
+        r" is energy cost plus battery degradation, the quantity minimised by"
+        r" the scheduler.}",
         r"\label{tab:performance}",
-        r"\begin{tabular}{lrrrrrrr}",
+        r"\begin{tabular}{lrrrrrr}",
         r"\toprule",
-        r"Scheme & Cost (\$) & Emiss.\ (g CO$_2$) & Deg.\ (\$)"
-        r" & $\Delta$Cost & $\Delta$Emiss. & $\Delta$Deg. \\",
+        r"Scheme & Total Cost (\$) & Energy (\$) & Deg.\ (\$)"
+        r" & Emiss.\ (g CO$_2$) & $\Delta$Cost & $\Delta$Emiss. \\",
         r"\midrule",
     ]
     for r in rows:
         latex_lines.append(
-            f"{r['Scheme']} & {r['Cost ($)']} & {r['Emissions (g)']} "
-            f"& {r['Degradation ($)']} & {r['Δ Cost']} & {r['Δ Emissions']} "
-            f"& {r['Δ Deg']} \\\\"
+            f"{r['Scheme']} & {r['Total Cost ($)']} & {r['Energy ($)']} "
+            f"& {r['Degradation ($)']} & {r['Emissions (g)']} "
+            f"& {r['Δ Cost tex']} & {r['Δ Emissions tex']} \\\\"
         )
     latex_lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     latex_str = "\n".join(latex_lines)
@@ -635,15 +654,15 @@ def table_performance(
     print(f"  saved -> {tex_path}")
 
     print("\n── Performance Table ───────────────────────────────────────────────────")
-    header = (f"  {'Scheme':<34} {'Cost ($)':>10} {'Emiss.(g)':>12} "
-              f"{'Deg($)':>10} {'ΔCost':>8} {'ΔEmiss':>9} {'ΔDeg':>8}")
+    header = (f"  {'Scheme':<34} {'Total($)':>9} {'Energy($)':>10} {'Deg($)':>8} "
+              f"{'Emiss.(g)':>12} {'ΔCost':>8} {'ΔEmiss':>9}")
     print(header)
     print("  " + "─" * (len(header) - 2))
     for r in rows:
         print(
-            f"  {r['Scheme']:<34} {r['Cost ($)']:>10} {r['Emissions (g)']:>12} "
-            f"{r['Degradation ($)']:>10} {r['Δ Cost']:>8} {r['Δ Emissions']:>9} "
-            f"{r['Δ Deg']:>8}"
+            f"  {r['Scheme']:<34} {r['Total Cost ($)']:>9} {r['Energy ($)']:>10} "
+            f"{r['Degradation ($)']:>8} {r['Emissions (g)']:>12} "
+            f"{r['Δ Cost']:>8} {r['Δ Emissions']:>9}"
         )
     print()
 

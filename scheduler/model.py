@@ -28,8 +28,17 @@ def _effective_carbon_cap(
 ) -> float | None:
     """
     Scale the carbon cap by the carbon-preference weight beta:
-    beta = 0 disables the cap, beta >= 1 applies it in full, and values in
-    between interpolate linearly between uncapped (1.0) and carbon_cap_fraction.
+
+        beta = 0        -> no cap (the operator places no weight on carbon)
+        0 < beta < 1    -> 1 - beta * (1 - carbon_cap_fraction)
+        beta >= 1       -> carbon_cap_fraction
+
+    The cap is treated as an expression of the operator's carbon preference
+    rather than an external policy limit, so it relaxes as beta falls. Note the
+    consequence: the cap is loosest where emissions are highest and tightest
+    where the objective has already driven emissions down, so it will typically
+    be slack across the whole sweep. Check the audit output before claiming the
+    cap influenced any reported result.
     """
     if carbon_cap_fraction is None:
         return None
@@ -222,31 +231,27 @@ def run_scheduler(
     deg_cost:            float = 0.02,
     nodal_prices:        dict  | None = None,
     grid_cap_kw:         float = 85.0,
+    carbon_baseline_g:   float | None = None,
 ):
     """
     Solve the EV charging / V2G LP and return (c, d, energy_vars, status).
 
     The objective is the ICS-weighted net charging cost plus a degradation
     penalty. Only the carbon cap is soft (via slack_carbon at cost PENALTY);
-    SOC-departure and per-node grid-cap constraints are hard. The cap is
-    beta-scaled by _effective_carbon_cap().
+    SOC-departure and per-node grid-cap constraints are hard.
+
+    The cap fraction is beta-scaled by _effective_carbon_cap. carbon_baseline_g
+    is the absolute reference emissions in g CO2 — pass the uncoordinated
+    schedule's actual emissions so the baseline the fraction multiplies is the
+    same number at every point in the sweep.
     """
     model     = lp.LpProblem("EV_Scheduler", lp.LpMinimize)
     time_list = list(time_slots)
 
     effective_carbon_cap = _effective_carbon_cap(beta, carbon_cap_fraction)
-    if carbon_cap_fraction is not None and effective_carbon_cap != carbon_cap_fraction:
-        if effective_carbon_cap is None:
-            print(
-                f"  ℹ Carbon cap disabled (beta={beta:.2f}; "
-                f"configured cap={carbon_cap_fraction} ignored)."
-            )
-        else:
-            print(
-                f"  ℹ Carbon cap relaxed by beta: "
-                f"configured={carbon_cap_fraction:.3f} → "
-                f"effective={effective_carbon_cap:.3f} (beta={beta:.2f})"
-            )
+    if carbon_cap_fraction is not None and effective_carbon_cap is None:
+        print(f"  ℹ Carbon cap disabled (beta={beta:.2f}; "
+              f"configured cap={carbon_cap_fraction} ignored).")
 
     # Primary decision variables
     c = lp.LpVariable.dicts(
@@ -323,13 +328,22 @@ def run_scheduler(
                 f"NodeCap_{node_name}_{t}",
             )
 
-    # Global carbon cap (soft, beta-scaled)
-    # Baseline = sum over each EV of: its node's carbon[t] × max_charging_power
+    # Global carbon cap (soft, beta-scaled fraction of a fixed baseline)
+    # Baseline is the uncoordinated schedule's actual emissions, passed in as an
+    # absolute value so the fraction multiplies the same number at every point
+    # in the sweep. Falls back to a max-power proxy if no baseline was supplied.
     if effective_carbon_cap is not None:
-        baseline = sum(
-            carbon.get(ev.node_id, {}).get(t, 0.0) * ev.max_charging_power * interval_hours
-            for ev in evs
-            for t  in active_slots(ev, time_list)
+        if carbon_baseline_g is not None:
+            baseline = carbon_baseline_g
+        else:
+            baseline = sum(
+                carbon.get(ev.node_id, {}).get(t, 0.0) * ev.max_charging_power * interval_hours
+                for ev in evs
+                for t  in active_slots(ev, time_list)
+            )
+        print(
+            f"  ℹ Carbon cap: {effective_carbon_cap:.3f} × {baseline:,.0f} g "
+            f"= {effective_carbon_cap * baseline:,.0f} g CO₂"
         )
         model += (
             lp.lpSum(
@@ -391,7 +405,15 @@ def run_scheduler(
 
     _report_carbon_violation(slack_carbon, effective_carbon_cap)
 
-    return c, d, energy_vars, status
+    diag = {
+        "cap_g":      (effective_carbon_cap * baseline
+                       if effective_carbon_cap is not None else None),
+        "baseline_g": baseline if effective_carbon_cap is not None else None,
+        "slack_g":    (slack_carbon.varValue or 0.0),
+        "objective":  lp.value(model.objective),
+    }
+
+    return c, d, energy_vars, status, diag
 
 
 def _report_carbon_violation(slack_carbon, carbon_cap_fraction):

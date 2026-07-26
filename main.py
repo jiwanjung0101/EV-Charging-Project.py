@@ -41,6 +41,11 @@ CONFIG = dict(
     interval_hours      = 1.0,
     max_distance        = 4.0,    # max EV-to-node Euclidean distance (grid units)
     out_dir             = "plots",
+    # Stage-1 node allocation is re-scored at every alpha, so each Pareto point
+    # reflects both the reallocation and the dispatch implied by that weighting.
+    # Set True to hold the allocation fixed at the balanced result instead,
+    # which isolates the dispatch effect.
+    freeze_pareto_assignments = False,
 )
 
 
@@ -151,7 +156,8 @@ def main() -> None:
         ev.node_id = opt_node_ids[ev.name]
 
     # 5. Balanced LP
-    c, d, energy_vars, status = run_scheduler(
+    # Cap is anchored to the uncoordinated baseline's measured emissions.
+    c, d, energy_vars, status, diag = run_scheduler(
         prices=prices, carbon=carbon, time_slots=time_list, evs=evs,
         interval_hours=CONFIG["interval_hours"],
         alpha=alpha_bal, beta=beta_bal,
@@ -161,6 +167,7 @@ def main() -> None:
         deg_cost=CONFIG["deg_cost"],
         nodal_prices=nodal_prices,
         grid_cap_kw=CONFIG["grid_cap_kw"],
+        carbon_baseline_g=base_emissions,
     )
     print(f"Solver status: {status}")
 
@@ -181,11 +188,14 @@ def main() -> None:
     print("══════════════════════════════════════════════════════════════")
     print(f"  {'Metric':<28} {'Balanced':>12} {'Baseline':>12} {'Δ':>8}")
     print(f"  {'-'*28} {'-'*12} {'-'*12} {'-'*8}")
-    print(f"  {'Total cost ($)':<28} {total_cost:>12.2f} {base_cost:>12.2f} {pct(total_cost,base_cost):>8}")
+    print(f"  {'Total cost ($)':<28} {total_cost + total_deg:>12.2f} "
+          f"{base_cost + base_deg:>12.2f} "
+          f"{pct(total_cost + total_deg, base_cost + base_deg):>8}")
+    print(f"  {'  of which energy ($)':<28} {total_cost:>12.2f} {base_cost:>12.2f} {pct(total_cost,base_cost):>8}")
     print(f"  {'Total emissions (g CO₂)':<28} {total_emissions:>12.2f} {base_emissions:>12.2f} {pct(total_emissions,base_emissions):>8}")
     print(f"  {'Total net energy (kWh)':<28} {total_energy:>12.2f} {base_energy:>12.2f} {pct(total_energy,base_energy):>8}")
     print(f"  {'Avg carbon intensity':<28} {avg_intensity:>12.2f} {base_avg_intensity:>12.2f} {pct(avg_intensity,base_avg_intensity):>8}")
-    print(f"  {'Total degradation ($)':<28} {total_deg:>12.2f} {base_deg:>12.2f} {pct(total_deg,base_deg):>8}")
+    print(f"  {'  of which degradation ($)':<28} {total_deg:>12.2f} {base_deg:>12.2f} {pct(total_deg,base_deg):>8}")
     print(f"  {'Avg EV–node distance':<28} {avg_dist_opt:>12.4f} {avg_dist_base:>12.4f} {pct(avg_dist_opt,avg_dist_base):>8}")
     print("══════════════════════════════════════════════════════════════\n")
 
@@ -219,6 +229,7 @@ def main() -> None:
         grid_cap_kw         = CONFIG["grid_cap_kw"],
         interval_hours      = CONFIG["interval_hours"],
         max_distance        = CONFIG["max_distance"],
+        freeze_pareto_assignments = CONFIG["freeze_pareto_assignments"],
     )
 
     # 8. Four-scheme summary
@@ -226,18 +237,22 @@ def main() -> None:
     print("\n══════════════════════════════════════════════════════════════════════")
     print("  Summary — all four schemes vs uncoordinated baseline")
     print("══════════════════════════════════════════════════════════════════════")
-    print(f"  {'Scheme':<34} {'Cost($)':>9} {'':>7} {'Emiss(g)':>11} {'':>7} {'Deg($)':>8}")
-    print(f"  {'─'*34} {'─'*9} {'─'*7} {'─'*11} {'─'*7} {'─'*8}")
+    print(f"  {'Scheme':<34} {'Total($)':>9} {'':>7} {'Emiss(g)':>11} {'':>7} "
+          f"{'Energy($)':>10} {'Deg($)':>8}")
+    print(f"  {'─'*34} {'─'*9} {'─'*7} {'─'*11} {'─'*7} {'─'*10} {'─'*8}")
 
     def pct2(v, b):
         return f"({(v - b) / abs(b) * 100:+.0f}%)" if abs(b) > 1e-9 else ""
 
+    # Total cost is energy + degradation — the quantity the LP minimises.
+    base_total = unmanaged.total_cost + unmanaged.total_deg
     for sr in results:
+        total = sr.total_cost + sr.total_deg
         print(
             f"  {sr.label:<34} "
-            f"{sr.total_cost:>9.2f} {pct2(sr.total_cost, unmanaged.total_cost):>7} "
+            f"{total:>9.2f} {pct2(total, base_total):>7} "
             f"{sr.total_emissions:>11.2f} {pct2(sr.total_emissions, unmanaged.total_emissions):>7} "
-            f"{sr.total_deg:>8.2f} {pct2(sr.total_deg, unmanaged.total_deg):>7}"
+            f"{sr.total_cost:>10.2f} {sr.total_deg:>8.2f}"
         )
     print()
 
